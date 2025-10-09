@@ -1,3 +1,5 @@
+<img width="1027" height="566" alt="Screenshot 2025-10-09 at 12 10 39 PM" src="https://github.com/user-attachments/assets/43d593ed-3426-4532-8462-f3108dcf4f33" />
+
 # vlmrl
 
 A reinforcement learning framework for vision-language models, written in JAX.
