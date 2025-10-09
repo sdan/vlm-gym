@@ -4,7 +4,7 @@ is a RL framework for vision–language models written in JAX.
 
 `models/qwen25vl` natively implements Qwen2.5-VL with mRoPE, KV cache, grouped-query attention, and all the nicities you'd want to do inference(`core/sampling.py`), training(`core/grpo.py`), and evaluation(`core/eval.py`).
 
-vlmrl makes it easy to implement new vision environments(very simple to do in `envs/base.py`) specifically for vision-language models for grounding, computer-use, multimodal reasoning, etc.
+vlmrl makes it easy to implement new vision environments(very simple to do in `envs/base.py`) specifically for vision-language models for grounding, computer-use, multimodal reasoning.
 
 
 ## Quickstart
