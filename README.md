@@ -1,31 +1,37 @@
 # vlmrl
 
-is a RL framework for vision–language models written in JAX.
+A reinforcement learning framework for vision-language models, written in JAX.
 
-`models/qwen25vl` natively implements Qwen2.5-VL with mRoPE, KV cache, grouped-query attention, and all the nicities you'd want to do inference(`core/sampling.py`), training(`core/grpo.py`), and evaluation(`core/eval.py`).
+**Core components:**
+- `models/qwen25vl` — Qwen2.5-VL with mRoPE, KV cache, grouped-query attention
+- `core/sampling.py` — Inference
+- `core/grpo.py` — Training (GRPO)
+- `core/eval.py` — Evaluation
+- `envs/base.py` — Vision environments for captioning, multimodal reasoning, etc.
 
-vlmrl makes it easy to implement new vision environments(very simple to do in `envs/base.py`) specifically for vision-language models for grounding, computer-use, multimodal reasoning.
-
+---
 
 ## Quickstart
-- Install
+
+**Install**
 ```bash
 uv sync
 ```
-- Convert HF → JAX (defaults to Qwen/Qwen2.5-VL-7B-Instruct)
+
+**Convert HF → JAX** (defaults to Qwen/Qwen2.5-VL-7B-Instruct)
 ```bash
 python -m utils.hf_to_jax --model_dir checkpoints/qwen25vl_7b
 ```
-Writes `checkpoints/qwen25vl_7b/params.pkl` and tokenizer files.
 
-- Sample
+**Sample**
 ```bash
 python -m core.sampling \
   --ckpt_dir checkpoints/qwen25vl_7b \
   --image imgs/f35_takeoff.png \
   --prompt "Describe the image"
 ```
-- Train (GRPO)
+
+**Train (GRPO)**
 ```bash
 python core/grpo.py \
   --model_dir=checkpoints/qwen25vl_7b \
@@ -36,7 +42,8 @@ python core/grpo.py \
   --total_steps=10000 \
   --wandb_project=vlm-rl
 ```
-- Eval
+
+**Eval**
 ```bash
 python core/eval.py \
   --model_dir checkpoints/qwen25vl_7b \
@@ -47,27 +54,34 @@ python core/eval.py \
   --top_k=5
 ```
 
+---
+
 ## Environments
-- Add your own extending `envs.base.BaseEnv`.
-- `vision` / `vision_caption`: single‑image captioning; reward = keyword hits.
-- `nlvr2`: two‑image True/False reasoning (downloads via `datasets`).
+
+Extend `envs.base.BaseEnv` to add custom vision environments.
+
+**Built-in:**
+- `vision` / `vision_caption` — Single-image captioning; reward = keyword hits
+- `nlvr2` — Two-image True/False reasoning
+
+---
 
 ## Requirements
+
 - Python 3.10+
-- Linux, CUDA 12, NVIDIA GPU (≈60GB VRAM for 7B)
+- Linux, CUDA 12, NVIDIA GPU (~60GB VRAM for 7B)
 - JAX 0.6.1 (CUDA 12 build)
-- Qwen2.5-VL 7B-Instruct (for some reason 7b works but 3b doesn't)
 
 ---
 
 ## References
 
-- **lmpo**: [kvfrans/lmpo](https://github.com/kvfrans/lmpo)
-- **Qwen model base**: [jax-ml/jax-llm-examples](https://github.com/jax-ml/jax-llm-examples/tree/main/qwen3)
-- **NLVR2 dataset**: [HuggingFaceM4/NLVR2](https://huggingface.co/datasets/HuggingFaceM4/NLVR2)
+- **lmpo** — [kvfrans/lmpo](https://github.com/kvfrans/lmpo)
+- **Qwen model base** — [jax-ml/jax-llm-examples](https://github.com/jax-ml/jax-llm-examples/tree/main/qwen3)
+- **NLVR2 dataset** — [HuggingFaceM4/NLVR2](https://huggingface.co/datasets/HuggingFaceM4/NLVR2)
 
 ---
 
 ## License
 
-See `LICENSE` and `NOTICE` files for details.
+See `LICENSE` and `NOTICE`.
