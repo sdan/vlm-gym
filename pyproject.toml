@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlmrl"
+version = "0.0.1"
+description = "RL for Vision Language Models"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "absl-py",
+    "ml-collections",
+    "wandb",
+    "einops",
+    "jaxtyping",
+    "opt-einsum",
+    "transformers",
+    "torch",
+    "tqdm",
+    "jax[cuda12]==0.6.1",
+    "optax==0.2.5",
+    "flax==0.10.6",
+    "chex==0.1.89",
+    "datasets>=4.1.1",
+]
+
+[tool.setuptools]
+packages = ["vlmrl.core", "vlmrl.envs", "vlmrl.models", "vlmrl.utils"]
+
+[tool.setuptools.package-dir]
+"vlmrl.core" = "core"
+"vlmrl.envs" = "envs"
+"vlmrl.models" = "models"
+"vlmrl.utils" = "utils"
