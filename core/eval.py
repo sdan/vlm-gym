@@ -83,13 +83,16 @@ def eval_model(
 
         action_tokens_list = []
         for obs in env_tokens:
-            # Single-image vision caption env
-            if hasattr(obs, "image_path") and hasattr(obs, "question"):
+            # Single-image vision caption env (supports path or PIL image)
+            if hasattr(obs, "question") and (hasattr(obs, "image_path") or hasattr(obs, "image")):
                 vision_spec = model.spec.vision
                 if vision_spec is None:
                     raise ValueError("This VLM checkpoint has no vision backbone configured.")
+                image_input = getattr(obs, "image_path", None)
+                if image_input is None:
+                    image_input = getattr(obs, "image", None)
                 pixel_values, grid_thw = preprocess_image(
-                    obs.image_path,
+                    image_input,
                     patch_size=vision_spec.patch_size,
                     spatial_merge_size=vision_spec.spatial_merge_size,
                     temporal_patch_size=vision_spec.temporal_patch_size,
@@ -99,6 +102,16 @@ def eval_model(
                 vision_embeds = model.apply({"params": params}, pixel_values, grid_thw, method=model.encode_vision)
                 num_vision_tokens = int(vision_embeds.shape[0])
                 prompt_text = chat_prompt_with_image(num_vision_tokens, obs.question)
+                # Debug: Print the prompt to verify it contains the question
+                if jax.process_index() == 0:  # Only print from first process
+                    print(f"\n[DEBUG] Full prompt text being sent to model:")
+                    print(f"Question from obs: {obs.question}")
+                    print(f"Number of vision tokens: {num_vision_tokens}")
+                    # Truncate the prompt for display (avoid showing all image_pad tokens)
+                    display_prompt = prompt_text.replace('<|image_pad|>' * num_vision_tokens, f'<|image_pad|>*{num_vision_tokens}')
+                    print(f"Formatted prompt: {display_prompt}")
+                    print("-" * 80)
+
                 input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
                 prompt_tokens = jnp.asarray([input_ids], dtype=jnp.int32)
 
@@ -117,6 +130,11 @@ def eval_model(
                     rng=key,
                     return_logprobs=False,
                 )
+                # Debug: Decode and print the generated response
+                if jax.process_index() == 0:  # Only print from first process
+                    generated_text = tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
+                    print(f"[DEBUG] Generated response: {generated_text}")
+                    print("-" * 80)
                 action_tokens_list.append(generated[0].tolist())
             # NLVR2-style two-image prompt
             elif hasattr(obs, "image_left") and hasattr(obs, "image_right") and hasattr(obs, "statement"):
@@ -166,10 +184,15 @@ def eval_model(
                     rng=key,
                     return_logprobs=False,
                 )
+                # Debug: Decode and print the generated response
+                if jax.process_index() == 0:  # Only print from first process
+                    generated_text = tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
+                    print(f"[DEBUG] Generated response: {generated_text[:200]}...")  # First 200 chars
+                    print("-" * 80)
                 action_tokens_list.append(generated[0].tolist())
             else:
                 raise ValueError(
-                    "This eval only supports VLM envs with `image_path`+`question` or NLVR2 with two images + statement."
+                    "This eval only supports VLM envs with a single image + question, or NLVR2 with two images + statement."
                 )
 
         new_states, _, returns_local, dones, env_infos = env.step_list(env_states, action_tokens_list)
@@ -199,8 +222,13 @@ def eval_model(
 ##################################################
 if __name__ == '__main__':
     config = ml_collections.ConfigDict({
+        # model checkpoint directory.
+        'model_dir': '',
         # env settings.
         'env_name': 'vision',
+        # Generic env kwargs (JSON). Passed to env constructor.
+        # Example: '{"split":"test","difficulty_schedule":{"0":"city"},"max_samples":200}'
+        'env_kwargs': '',
         'max_eval_tasks': -1,   # when > 0, limit number of tasks evaluated
         'num_generation_tokens': 128, # -1 = use default from env.
         'force_answer_at': -1, # -1 = use default from env.
@@ -243,7 +271,20 @@ if __name__ == '__main__':
     vlm_sampler = VLMSampler(model, params)
     image_pad_id = _resolve_image_pad_id(tokenizer, ckpt_dir)
 
-    env = create_env(FLAGS.env_name, tokenizer)
+    # Parse env kwargs if provided
+    env_kwargs = {}
+    try:
+        raw_env_kwargs = getattr(FLAGS, 'env_kwargs', '') or ''
+        if isinstance(raw_env_kwargs, str) and len(raw_env_kwargs.strip()) > 0:
+            import json as _json
+            env_kwargs = _json.loads(raw_env_kwargs)
+            if not isinstance(env_kwargs, dict):
+                raise ValueError("--env_kwargs must be a JSON object")
+    except Exception as e:
+        print(f"Warning: failed to parse --env_kwargs: {e}")
+        env_kwargs = {}
+
+    env = create_env(FLAGS.env_name, tokenizer, **env_kwargs)
     if FLAGS.num_generation_tokens == -1:
         FLAGS.num_generation_tokens = env.tokens_per_action
     if FLAGS.force_answer_at == -1:
@@ -287,6 +328,11 @@ if __name__ == '__main__':
         print(f"return: {float(np.mean(returns))}")
     # Print sample responses in full (truncated)
     responses = env_infos_history.get('response', [])
+    ground_truths = env_infos_history.get('ground_truth', [])
+    predicted_vals = env_infos_history.get('predicted', [])
+    correct_vals = env_infos_history.get('correct', [])
+    reward_weights = env_infos_history.get('reward_weights', [])
+
     if len(responses) > 0:
         n = int(getattr(FLAGS, 'log_samples', 3) or 3)
         trunc = int(getattr(FLAGS, 'log_truncate', 256) or 256)
@@ -297,7 +343,34 @@ if __name__ == '__main__':
             if len(text) > trunc:
                 text = text[:trunc] + "..."
             r = float(returns[i]) if i < len(returns) else float('nan')
-            print(f"[{i}] reward={r:.3f} response=\n{text}\n")
+
+            # Print response and reward
+            print(f"[{i}] reward={r:.3f}")
+
+            # Print ground truth if available
+            if i < len(ground_truths):
+                gt = ground_truths[i]
+                if isinstance(gt, dict):
+                    print(f"  Ground truth: country={gt.get('country', 'N/A')}, "
+                          f"city={gt.get('city', 'N/A')}, "
+                          f"region={gt.get('region', 'N/A')}")
+
+            # Print what was extracted vs what was expected
+            if i < len(predicted_vals):
+                print(f"  Extracted: {predicted_vals[i]}")
+            if i < len(correct_vals):
+                print(f"  Expected: {correct_vals[i]}")
+            if i < len(reward_weights):
+                weights = reward_weights[i]
+                if isinstance(weights, dict):
+                    print(
+                        "  Reward weights:"
+                        f" country={weights.get('country', 'N/A')},"
+                        f" region={weights.get('region', 'N/A')},"
+                        f" city={weights.get('city', 'N/A')}"
+                    )
+
+            print(f"  Response: {text}\n")
     else:
         print("No 'response' field found in env infos.")
 

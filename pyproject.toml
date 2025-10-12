@@ -6,7 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "vlmrl"
 version = "0.0.1"
 description = "RL for Vision Language Models"
+readme = "README.md"
 requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Surya Dantuluri"}]
+keywords = ["reinforcement-learning", "vision-language-models", "jax"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+]
 dependencies = [
     "numpy",
     "absl-py",
@@ -24,6 +33,9 @@ dependencies = [
     "chex==0.1.89",
     "datasets>=4.1.1",
 ]
+
+[project.urls]
+Repository = "https://github.com/sdan/vlmrl"
 
 [tool.setuptools]
 packages = ["vlmrl.core", "vlmrl.envs", "vlmrl.models", "vlmrl.utils"]

@@ -398,6 +398,16 @@ def main(_):
             # Compute advantages per group
             returns = jnp.reshape(returns, (-1, int(FLAGS.group_size)))
             adv = returns
+            
+            # Log raw reward statistics before normalization
+            returns_flat = np.asarray(returns).flatten()
+            if jax.process_index() == 0:
+                env_infos_history.setdefault('rewards/mean', []).append(float(np.mean(returns_flat)))
+                env_infos_history.setdefault('rewards/std', []).append(float(np.std(returns_flat)))
+                env_infos_history.setdefault('rewards/min', []).append(float(np.min(returns_flat)))
+                env_infos_history.setdefault('rewards/max', []).append(float(np.max(returns_flat)))
+                env_infos_history.setdefault('rewards/median', []).append(float(np.median(returns_flat)))
+            
             if int(FLAGS.do_group_normalization):
                 gm = np.mean(adv, axis=-1)
                 gs = np.std(adv, axis=-1) + 1e-8
@@ -408,6 +418,14 @@ def main(_):
                 adv = (adv - gmean) / gstd
             if int(FLAGS.do_clip_advantages):
                 adv = np.clip(adv, a_min=0.0, a_max=None)
+            
+            # Log advantage statistics after normalization
+            adv_flat = np.asarray(adv).flatten()
+            if jax.process_index() == 0:
+                env_infos_history.setdefault('advantages/mean', []).append(float(np.mean(adv_flat)))
+                env_infos_history.setdefault('advantages/std', []).append(float(np.std(adv_flat)))
+                env_infos_history.setdefault('advantages/min', []).append(float(np.min(adv_flat)))
+                env_infos_history.setdefault('advantages/max', []).append(float(np.max(adv_flat)))
 
             # Flatten back and filter groups where all adv == 0 (optional)
             all_tokens_arr = _pad_right(all_tokens_list, pad_val=pad_id, axis=0)
@@ -624,6 +642,19 @@ def main(_):
                 old_logprobs = jnp.where(int(FLAGS.do_inference_logprobs) == 1, inference_logprobs, recalc_logprobs)
                 logratio = token_logprobs - old_logprobs
                 ratio = jnp.exp(logratio)
+                
+                # Compute PPO metrics
+                def avg_over_mask(x):
+                    return jnp.sum(x * mask_origin) / (jnp.sum(mask_origin) + 1e-8)
+                
+                # Approx KL divergence: mean(ratio - 1 - log(ratio))
+                approx_kl = avg_over_mask(ratio - 1.0 - logratio)
+                
+                # Ratio statistics
+                ratio_mean = avg_over_mask(ratio)
+                ratio_clipped = jnp.clip(ratio, 1.0 - FLAGS.clip_epsilon, 1.0 + FLAGS.clip_epsilon)
+                ratio_clipped_frac = avg_over_mask((jnp.abs(ratio - ratio_clipped) > 1e-6).astype(jnp.float32))
+                
                 if int(FLAGS.do_ppo_all_clip):
                     pg_loss = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon, 1 + FLAGS.clip_epsilon)
                 else:
@@ -631,8 +662,6 @@ def main(_):
                     pg_loss2 = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon, 1 + FLAGS.clip_epsilon)
                     pg_loss = jnp.maximum(pg_loss1, pg_loss2)
 
-                def avg_over_mask(x):
-                    return jnp.sum(x * mask_origin) / (jnp.sum(mask_origin) + 1e-8)
                 entropy_avg = avg_over_mask(entropy)
                 loss_pg = jnp.mean(pg_loss * mask_origin)
                 loss_ent = -entropy_avg * float(FLAGS.entropy_coef)
@@ -642,6 +671,9 @@ def main(_):
                     'loss_pg': loss_pg,
                     'loss_ent': loss_ent,
                     'entropy': entropy_avg,
+                    'ppo/approx_kl': approx_kl,
+                    'ppo/ratio_mean': ratio_mean,
+                    'ppo/ratio_clipped_frac': ratio_clipped_frac,
                 }
 
             grads, info = jax.grad(loss_fn, has_aux=True)(state.params)
@@ -688,6 +720,20 @@ def main(_):
             info['times/total_time_rollouts'] = time.time() - t_start_roll
             info['times/total_time_update'] = time.time() - t_update_start
             info['minibatches_per_global_step'] = int(mb_count)
+            
+            # Extract learning rate from optimizer state
+            try:
+                if hasattr(train_state.opt_state, 'hyperparams'):
+                    # AdamW-style optimizer
+                    lr = float(train_state.opt_state.hyperparams.get('learning_rate', FLAGS.lr))
+                elif hasattr(train_state.opt_state, 'count'):
+                    # Adafactor-style - use config LR
+                    lr = float(FLAGS.lr)
+                else:
+                    lr = float(FLAGS.lr)
+                info['training/learning_rate'] = lr
+            except Exception:
+                info['training/learning_rate'] = float(FLAGS.lr)
             for k, v in env_infos_history.items():
                 if isinstance(v, (list, tuple)):
                     vals = v
@@ -700,7 +746,50 @@ def main(_):
                         info[f'env/{k}'] = float(np.mean(vals_np))
                 except Exception:
                     pass
+            
+            # Enhanced response logging with W&B tables
             if jax.process_index() == 0:
+                try:
+                    responses = env_infos_history.get('response', [])
+                    rewards = env_infos_history.get('return', [])
+                    if responses and rewards and len(responses) == len(rewards):
+                        # Find best and worst samples
+                        rewards_arr = np.array(rewards)
+                        n_samples = min(5, len(rewards))  # Log top 5 and bottom 5
+                        
+                        # Get indices of best and worst
+                        best_idxs = np.argsort(rewards_arr)[-n_samples:][::-1]
+                        worst_idxs = np.argsort(rewards_arr)[:n_samples]
+                        
+                        # Build table data
+                        table_rows = []
+                        for idx in best_idxs:
+                            table_rows.append([
+                                int(step_idx),
+                                "best",
+                                float(rewards[idx]),
+                                str(responses[idx])[:500],  # Truncate long responses
+                                env_infos_history.get('predicted', [None] * len(rewards))[idx] if 'predicted' in env_infos_history else None,
+                            ])
+                        for idx in worst_idxs:
+                            table_rows.append([
+                                int(step_idx),
+                                "worst",
+                                float(rewards[idx]),
+                                str(responses[idx])[:500],
+                                env_infos_history.get('predicted', [None] * len(rewards))[idx] if 'predicted' in env_infos_history else None,
+                            ])
+                        
+                        if table_rows:
+                            response_table = wandb.Table(
+                                columns=['step', 'category', 'reward', 'response', 'predicted'],
+                                data=table_rows
+                            )
+                            info['samples/responses'] = response_table
+                except Exception as e:
+                    # Keep non-fatal
+                    pass
+                
                 wandb.log(info)
                 # If building a viz snapshot, append a few numeric lines now that we have update stats
                 if snapshot is not None and snapshot.get('log_lines') is not None and len(snapshot['log_lines']) < 1:
