@@ -5,14 +5,18 @@ from dataclasses import dataclass
 from typing import Sequence, Tuple, Optional, Dict, Any
 from pathlib import Path
 
-import csv
-from io import StringIO
-
 import pandas as pd
 from PIL import Image
 import re
 import unicodedata
 from math import exp
+
+try:
+    import pycountry  # type: ignore
+except ImportError as exc:  # pragma: no cover - dependency required
+    raise ImportError(
+        "The OSV5M environment requires `pycountry`. Install it via `pip install pycountry`."
+    ) from exc
 
 from vlmrl.envs.base import BaseEnv, BaseState
 from vlmrl.utils.vlm import decode_tokens
@@ -402,15 +406,13 @@ class OSV5MEnv(BaseEnv):
 
         # Normalize predictions
         pred_country = self._normalize_country(parsed.get("country")) if parsed.get("country") is not None else None
-        # Pass the predicted country to help with region/city normalization
-        pred_region = self._normalize_region_or_city(parsed.get("region"), pred_country) if parsed.get("region") is not None else None
-        pred_city = self._normalize_region_or_city(parsed.get("city"), pred_country) if parsed.get("city") is not None else None
+        pred_region = self._normalize_region_or_city(parsed.get("region")) if parsed.get("region") is not None else None
+        pred_city = self._normalize_region_or_city(parsed.get("city")) if parsed.get("city") is not None else None
 
         # Normalize ground truth
         gt_country_norm = (gt_country.upper() if gt_country else None)
-        # Use the ground truth country for normalizing GT regions/cities
-        gt_region_norm = self._normalize_region_or_city(gt_region, gt_country_norm) if gt_region else None
-        gt_city_norm = self._normalize_region_or_city(gt_city, gt_country_norm) if gt_city else None
+        gt_region_norm = self._normalize_region_or_city(gt_region) if gt_region else None
+        gt_city_norm = self._normalize_region_or_city(gt_city) if gt_city else None
 
         # Hierarchical score
         hier = 0.0
@@ -473,428 +475,115 @@ class OSV5MEnv(BaseEnv):
 
     # ---------------------------- Normalizers ---------------------------- #
     def _parse_structured_response(self, text: str) -> Tuple[Dict[str, Any], set[str]]:
-        """Parse structured predictions (JSON, key-value, CSV, list formats).
+        """Parse colon-delimited key/value predictions.
 
         Returns both the parsed fields and a set describing which structured
         patterns were detected so formatting rewards can be applied.
         """
-        import json
-
         parsed: Dict[str, Any] = {}
         structure_hits: set[str] = set()
         if not text:
             return parsed, structure_hits
 
-        # Extract JSON from code blocks or raw JSON
-        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-        if not json_match:
-            # Try to find raw JSON without code blocks
-            json_match = re.search(r'(\{.*?\})', text, re.DOTALL)
+        key_pattern = re.compile(
+            r'^\s*(?:[-*+\u2022]\s*)?(?P<key>[A-Za-z][A-Za-z0-9\s\-/_.]*?)\s*:\s*(?P<value>.+)$'
+        )
+        key_aliases = {
+            "city": "city",
+            "country": "country",
+            "region": "region",
+            "state": "region",
+            "province": "region",
+            "latitude": "lat",
+            "lat": "lat",
+            "longitude": "lon",
+            "lon": "lon",
+        }
 
-        if json_match:
-            try:
-                data = json.loads(json_match.group(1))
-                structure_hits.add("json")
-
-                # Extract fields with flexible key names
-                if "description" in data:
-                    parsed["description"] = str(data["description"])
-                if "city" in data:
-                    parsed["city"] = str(data["city"])
-                if "region" in data or "state" in data or "province" in data:
-                    parsed["region"] = str(data.get("region") or data.get("state") or data.get("province"))
-                if "country" in data:
-                    parsed["country"] = str(data["country"])
-
-                # Handle coordinates - could be array or separate lat/lon
-                if "coordinates" in data and isinstance(data["coordinates"], list) and len(data["coordinates"]) >= 2:
-                    parsed["lat"] = float(data["coordinates"][0])
-                    parsed["lon"] = float(data["coordinates"][1])
-                elif "latitude" in data and "longitude" in data:
-                    parsed["lat"] = float(data["latitude"])
-                    parsed["lon"] = float(data["longitude"])
-
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
-
-        def canonical_field(key: str) -> Optional[str]:
-            lowered = key.strip().lower()
-            lowered = lowered.replace("-", " ")
-            lowered = lowered.replace("_", " ")
-            lowered = lowered.replace(".", " ")
-            lowered = re.sub(r"\s+", " ", lowered)
-            if "latitude" in lowered or lowered.strip() in {"lat"}:
-                return "lat"
-            if "longitude" in lowered or lowered.strip() in {"lon", "long", "lng"}:
-                return "lon"
-            if "coordinate" in lowered:
-                return "coords"
-            if "country" in lowered:
-                return "country"
-            if "city" in lowered:
-                return "city"
-            if "region" in lowered or "state" in lowered or "province" in lowered:
-                return "region"
-            return None
-
-        def merge_value(key: str, value):
-            if value is None:
-                return
-            if key in {"city", "region", "country"}:
-                clean_val = str(value).strip().strip("`\"' \t,;")
-                if clean_val and key not in parsed:
-                    parsed[key] = clean_val
-                return
-            if key in {"lat", "lon"}:
-                if key in parsed:
-                    return
-                match = re.search(r"-?\d+(?:[.,]\d+)?", str(value))
-                if not match:
-                    return
-                num_str = match.group(0).replace(",", ".")
-                try:
-                    parsed[key] = float(num_str)
-                except (TypeError, ValueError):
-                    pass
-                return
-            if key == "coords":
-                match_vals = re.findall(r"-?\d+(?:[.,]\d+)?", str(value))
-                if len(match_vals) >= 2:
-                    if "lat" not in parsed:
-                        try:
-                            parsed["lat"] = float(match_vals[0].replace(",", "."))
-                        except ValueError:
-                            pass
-                    if "lon" not in parsed:
-                        try:
-                            parsed["lon"] = float(match_vals[1].replace(",", "."))
-                        except ValueError:
-                            pass
-
-        def parse_key_value(candidate_text: str):
-            matched = False
-            for key, value in re.findall(
-                r'(?im)^\s*(?:[-*+\u2022]\s*|\d+[\).\s-]+\s*)?(?:"|`)?([A-Za-z][A-Za-z0-9\s\-/_.]*?)(?:"|`)?\s*[:=\-]\s*([^\n\r]+)',
-                candidate_text,
-            ):
-                canonical = canonical_field(key)
-                if canonical:
-                    merge_value(canonical, value)
-                    matched = True
-            if matched:
-                structure_hits.add("key_value")
-
-        def parse_csv_like(candidate_text: str):
-            try:
-                reader = list(csv.reader(StringIO(candidate_text)))
-            except csv.Error:
-                return
-
-            header_row = None
-            data_row = None
-            for row in reader:
-                if not row or not any(cell.strip() for cell in row):
-                    continue
-                normalized = [cell.strip().lower() for cell in row]
-                if any(
-                    any(token in cell for token in ("city", "region", "state", "province", "country", "lat", "lon"))
-                    for cell in normalized
-                ):
-                    header_row = row
-                    break
-            if header_row is None:
-                return
-            header_idx = reader.index(header_row)
-            for row in reader[header_idx + 1 :]:
-                if row and any(cell.strip() for cell in row):
-                    data_row = row
-                    break
-            if data_row is None:
-                return
-            structure_hits.add("csv")
-            for key_cell, value_cell in zip(header_row, data_row):
-                canonical = canonical_field(key_cell)
-                if canonical:
-                    merge_value(canonical, value_cell)
-
-        def parse_space_separated(candidate_text: str):
-            matched = False
-            for line in candidate_text.splitlines():
-                stripped = line.strip()
-                if not stripped or len(stripped) > 120:
-                    continue
-                sep_match = re.match(
-                    r'^\s*(?:[-*+\u2022]\s*|\d+[\).\s-]+\s*)?(?:"|`)?([A-Za-z][A-Za-z0-9\s\-/_.]*?)(?:"|`)?\s+([^\s].*)$',
-                    stripped,
-                )
-                if not sep_match:
-                    continue
-                key, value = sep_match.groups()
-                canonical = canonical_field(key)
-                if not canonical:
-                    continue
-                if canonical in {"city", "region", "country"} and len(value.strip()) > 80:
-                    continue
-                merge_value(canonical, value)
-                matched = True
-            if matched:
-                structure_hits.add("space")
-
-        candidate_strings = []
-        candidate_strings.extend([
-            block.strip()
-            for block in re.findall(r"```(?:[a-zA-Z0-9]+)?\s*([\s\S]*?)```", text)
-            if block.strip()
-        ])
-        candidate_strings.append(text.strip())
-
-        for candidate in candidate_strings:
-            if not candidate:
+        for raw_line in text.splitlines():
+            match = key_pattern.match(raw_line)
+            if not match:
                 continue
-            parse_key_value(candidate)
-            parse_space_separated(candidate)
-            if "," in candidate or ";" in candidate or "\t" in candidate:
-                parse_csv_like(candidate)
+            raw_key = match.group("key")
+            raw_value = match.group("value")
+
+            key_clean = raw_key.strip().lower()
+            key_clean = key_clean.strip("*_`\"' ")
+            key_clean = re.sub(r"\s+", " ", key_clean)
+            canonical = key_aliases.get(key_clean)
+            if canonical is None:
+                continue
+
+            value_clean = raw_value.strip()
+            value_clean = value_clean.strip("`\"' \t")
+            value_clean = re.sub(r"^[*_`]+", "", value_clean)
+            value_clean = re.sub(r"[*_`]+$", "", value_clean)
+            value_clean = value_clean.strip()
+
+            if canonical in {"city", "region", "country"}:
+                if value_clean and canonical not in parsed:
+                    parsed[canonical] = value_clean
+                    structure_hits.add("key_value")
+            elif canonical in {"lat", "lon"}:
+                if canonical in parsed:
+                    continue
+                match_num = re.search(r"-?\d+(?:[.,]\d+)?", value_clean)
+                if not match_num:
+                    continue
+                number = match_num.group(0).replace(",", ".")
+                try:
+                    parsed[canonical] = float(number)
+                    structure_hits.add("key_value")
+                except ValueError:
+                    continue
 
         return parsed, structure_hits
 
     def _normalize_country(self, s: Optional[str]) -> Optional[str]:
+        """Normalize country name to ISO-3166 alpha-2 code using pycountry.
+
+        Returns the 2-letter ISO code (e.g., "US", "GB", "FR") or None if not found.
+        """
         if s is None:
             return None
-        x = s.strip().upper()
-        # Map common names/aliases to ISO2 (check this first, even for 2-letter codes)
-        country_map = {
-            "UNITED STATES": "US", "USA": "US", "US": "US", "AMERICA": "US",
-            "UNITED KINGDOM": "GB", "UK": "GB", "BRITAIN": "GB", "ENGLAND": "GB",
-            "FRANCE": "FR", "GERMANY": "DE", "ITALY": "IT",
-            "SPAIN": "ES", "JAPAN": "JP", "CHINA": "CN",
-            "INDIA": "IN", "BRAZIL": "BR", "CANADA": "CA",
-            "AUSTRALIA": "AU", "RUSSIA": "RU", "MEXICO": "MX",
-            "NETHERLANDS": "NL", "HOLLAND": "NL",
-            "SWEDEN": "SE", "NORWAY": "NO", "DENMARK": "DK",
-            "BOLIVIA": "BO", "CHILE": "CL", "ARGENTINA": "AR",
-            "PERU": "PE", "COLOMBIA": "CO", "ECUADOR": "EC",
-            "PORTUGAL": "PT", "IRELAND": "IE", "POLAND": "PL",
-        }
-        # Check map first
-        if x in country_map:
-            return country_map[x]
-        # If not in map and it's a valid ISO2 code, return as-is
-        if re.fullmatch(r"[A-Z]{2}", x):
-            return x
-        # Otherwise return None
+        raw = str(s).strip()
+        if not raw:
+            return None
+
+        # If already ISO-2 format, return as-is
+        upper = raw.upper()
+        if re.fullmatch(r"[A-Z]{2}", upper):
+            return upper
+
+        # Use pycountry to look up country
+        try:
+            match = pycountry.countries.lookup(raw)  # type: ignore[attr-defined]
+        except (LookupError, AttributeError):
+            return None
+
+        if match is not None and hasattr(match, "alpha_2"):
+            return str(match.alpha_2).upper()
+
         return None
 
-    def _normalize_region_or_city(self, s: Optional[str], country_code: Optional[str] = None) -> Optional[str]:
+    def _normalize_region_or_city(self, s: Optional[str]) -> Optional[str]:
+        """Normalize region/city name to canonical form for comparison.
+
+        Handles diacritics, case, and whitespace normalization.
+        """
         if s is None:
             return None
         x = str(s)
-        # Remove diacritics
+        # Remove diacritics (e.g., "São Paulo" → "Sao Paulo")
         x = unicodedata.normalize('NFKD', x).encode('ascii', 'ignore').decode('ascii')
-        # Lowercase and strip punctuation at ends
+        # Lowercase and strip
         x = x.strip().lower()
         # Remove common prefixes
         x = re.sub(r"^(state of|province of|community of|autonomous community of|region of|county of|city of)\s+", "", x)
         # Collapse whitespace
         x = re.sub(r"\s+", " ", x)
-
-        # Check country-specific aliases if country provided
-        if country_code:
-            aliases = self._get_region_city_aliases()
-            if country_code in aliases:
-                country_aliases = aliases[country_code]
-                # Check if the normalized string is an alias
-                if x in country_aliases:
-                    x = country_aliases[x]
-
         return x
 
-    def _get_region_city_aliases(self) -> Dict[str, Dict[str, str]]:
-        """Get country-specific aliases for regions and cities.
-
-        Returns a dict mapping: {country_code: {alias: canonical_name}}
-        This handles common variations, abbreviations, and alternate names.
-        """
-        return {
-            # United States - state abbreviations and common variations
-            "US": {
-                # State abbreviations
-                "ca": "california", "cal": "california", "calif": "california",
-                "ny": "new york", "n.y.": "new york", "nyc": "new york city",
-                "tx": "texas", "tex": "texas",
-                "fl": "florida", "fla": "florida",
-                "il": "illinois", "ill": "illinois",
-                "pa": "pennsylvania", "penn": "pennsylvania",
-                "oh": "ohio",
-                "ga": "georgia",
-                "nc": "north carolina", "n carolina": "north carolina",
-                "mi": "michigan", "mich": "michigan",
-                "nj": "new jersey", "n jersey": "new jersey",
-                "va": "virginia",
-                "wa": "washington",
-                "az": "arizona", "ariz": "arizona",
-                "ma": "massachusetts", "mass": "massachusetts",
-                "tn": "tennessee", "tenn": "tennessee",
-                "in": "indiana", "ind": "indiana",
-                "mo": "missouri",
-                "md": "maryland",
-                "wi": "wisconsin", "wis": "wisconsin", "wisc": "wisconsin",
-                "co": "colorado", "colo": "colorado",
-                "mn": "minnesota", "minn": "minnesota",
-                "sc": "south carolina", "s carolina": "south carolina",
-                "al": "alabama", "ala": "alabama",
-                "la": "louisiana",
-                "ky": "kentucky",
-                "or": "oregon", "ore": "oregon",
-                "ok": "oklahoma", "okla": "oklahoma",
-                "ct": "connecticut", "conn": "connecticut",
-                "ut": "utah",
-                "ia": "iowa",
-                "nv": "nevada", "nev": "nevada",
-                "ar": "arkansas", "ark": "arkansas",
-                "ms": "mississippi", "miss": "mississippi",
-                "ks": "kansas", "kan": "kansas",
-                "nm": "new mexico", "n mexico": "new mexico",
-                "ne": "nebraska", "neb": "nebraska", "nebr": "nebraska",
-                "wv": "west virginia", "w virginia": "west virginia",
-                "id": "idaho", "ida": "idaho",
-                "hi": "hawaii",
-                "nh": "new hampshire", "n hampshire": "new hampshire",
-                "me": "maine",
-                "ri": "rhode island", "r island": "rhode island",
-                "mt": "montana", "mont": "montana",
-                "de": "delaware", "del": "delaware",
-                "sd": "south dakota", "s dakota": "south dakota",
-                "nd": "north dakota", "n dakota": "north dakota",
-                "ak": "alaska", "alas": "alaska",
-                "vt": "vermont",
-                "wy": "wyoming", "wyo": "wyoming",
-                # Common city aliases
-                "la": "los angeles", "l.a.": "los angeles",
-                "sf": "san francisco", "san fran": "san francisco", "frisco": "san francisco",
-                "vegas": "las vegas",
-                "nola": "new orleans",
-                "philly": "philadelphia",
-                "dc": "washington dc", "washington d.c.": "washington dc",
-            },
-            # United Kingdom - common variations
-            "GB": {
-                "london": "greater london",
-                "manchester": "greater manchester",
-                "bham": "birmingham", "b'ham": "birmingham",
-                "yorks": "yorkshire",
-                "lancs": "lancashire",
-                "soton": "southampton",
-                "wolves": "wolverhampton",
-            },
-            # Spain - autonomous communities and common variations
-            "ES": {
-                "cataluna": "catalonia", "catalunya": "catalonia",
-                "balearics": "balearic islands", "baleares": "balearic islands",
-                "islas baleares": "balearic islands",
-                "canaries": "canary islands", "canarias": "canary islands",
-                "islas canarias": "canary islands",
-                "valencia": "valencian community", "comunidad valenciana": "valencian community",
-                "andalusia": "andalucia",
-                "bcn": "barcelona", "barna": "barcelona",
-                "mad": "madrid",
-                "vlc": "valencia",
-                "sev": "seville", "sevilla": "seville",
-                "zar": "zaragoza", "saragossa": "zaragoza",
-                "palm": "palma", "palma de mallorca": "palma",
-            },
-            # Germany - state variations
-            "DE": {
-                "bavaria": "bayern", "baviera": "bayern",
-                "nrw": "north rhine westphalia", "nordrhein westfalen": "north rhine westphalia",
-                "bw": "baden wurttemberg", "baden-wurttemberg": "baden wurttemberg",
-                "frankfurt": "frankfurt am main", "frankfurt/main": "frankfurt am main",
-            },
-            # France - region variations
-            "FR": {
-                "ile de france": "ile-de-france", "idf": "ile-de-france",
-                "provence alpes cote d'azur": "provence-alpes-cote d'azur", "paca": "provence-alpes-cote d'azur",
-                "rhone alpes": "auvergne-rhone-alpes",
-                "nord pas de calais": "hauts-de-france",
-                "marseille": "marseilles",
-            },
-            # Canada - province abbreviations
-            "CA": {
-                "on": "ontario", "ont": "ontario",
-                "qc": "quebec", "que": "quebec",
-                "bc": "british columbia", "b.c.": "british columbia",
-                "ab": "alberta", "alta": "alberta",
-                "mb": "manitoba", "man": "manitoba",
-                "sk": "saskatchewan", "sask": "saskatchewan",
-                "ns": "nova scotia", "n.s.": "nova scotia",
-                "nb": "new brunswick", "n.b.": "new brunswick",
-                "nf": "newfoundland", "nfld": "newfoundland", "nl": "newfoundland and labrador",
-                "pe": "prince edward island", "pei": "prince edward island", "p.e.i.": "prince edward island",
-                "nt": "northwest territories", "nwt": "northwest territories",
-                "yt": "yukon", "yk": "yukon",
-                "nu": "nunavut",
-                # City aliases
-                "mtl": "montreal",
-                "van": "vancouver",
-                "yyc": "calgary",
-                "yyz": "toronto",
-                "yvr": "vancouver",
-                "yul": "montreal",
-                "yow": "ottawa",
-                "yeg": "edmonton",
-            },
-            # Australia - state abbreviations
-            "AU": {
-                "nsw": "new south wales", "n.s.w.": "new south wales",
-                "vic": "victoria", "vict": "victoria",
-                "qld": "queensland", "queensl": "queensland",
-                "wa": "western australia", "w.a.": "western australia",
-                "sa": "south australia", "s.a.": "south australia",
-                "tas": "tasmania", "tassie": "tasmania",
-                "act": "australian capital territory", "a.c.t.": "australian capital territory",
-                "nt": "northern territory", "n.t.": "northern territory",
-                # City aliases
-                "melb": "melbourne",
-                "syd": "sydney",
-                "bris": "brisbane", "brissie": "brisbane",
-                "adl": "adelaide",
-            },
-            # Brazil - state abbreviations
-            "BR": {
-                "sp": "sao paulo",
-                "rj": "rio de janeiro", "rio": "rio de janeiro",
-                "mg": "minas gerais",
-                "ba": "bahia",
-                "rs": "rio grande do sul",
-                "pr": "parana",
-                "pe": "pernambuco",
-                "ce": "ceara",
-                "pa": "para",
-                "sc": "santa catarina",
-                "go": "goias",
-                "pb": "paraiba",
-                "ma": "maranhao",
-                "es": "espirito santo",
-                "am": "amazonas",
-                "rn": "rio grande do norte",
-                "al": "alagoas",
-                "pi": "piaui",
-                "mt": "mato grosso",
-                "df": "distrito federal", "brasilia": "distrito federal",
-                "ms": "mato grosso do sul",
-                "se": "sergipe",
-                "ro": "rondonia",
-                "to": "tocantins",
-                "ac": "acre",
-                "ap": "amapa",
-                "rr": "roraima",
-                # City aliases
-                "sampa": "sao paulo",
-                "bh": "belo horizonte",
-                "ssa": "salvador",
-                "bsb": "brasilia",
-            }
-        }
     def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Calculate distance between two coordinates in kilometers."""
         from math import radians, sin, cos, sqrt, atan2

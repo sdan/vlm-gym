@@ -32,6 +32,7 @@ dependencies = [
     "flax==0.10.6",
     "chex==0.1.89",
     "datasets>=4.1.1",
+    "pycountry>=24.6.1",
 ]
 
 [project.urls]

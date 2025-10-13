@@ -709,6 +709,10 @@ def main(_):
 
         # Training loop over minibatches
         t_update_start = time.time()
+
+        # Accumulate metrics across minibatches
+        accumulated_metrics = {}
+
         for j in range(mb_count):
             st = j * mb_size
             ed = min((j + 1) * mb_size, global_batch_size)
@@ -732,101 +736,114 @@ def main(_):
             info = jax.device_get(info)
             info = jax.tree.map(lambda x: np.array(x), info)
             info = jax.tree.map(lambda x: x.mean(), info)
-            info['total_rollouts'] = total_rollouts
-            if env.num_tasks != -1:
-                info['env_epochs'] = total_rollouts / env_num_tasks
-            info['rollout_iters_per_update'] = rollout_iters
-            info['global_step'] = step_idx
-            info['times/time_per_inference_iteration'] = (time.time() - t_start_roll) / max(rollout_iters, 1)
-            info['times/time_per_rollout'] = (time.time() - t_start_roll) / max(rollout_iters * rollout_batch_size * jax.host_count(), 1)
-            info['times/total_time_rollouts'] = time.time() - t_start_roll
-            info['times/total_time_update'] = time.time() - t_update_start
-            info['minibatches_per_global_step'] = int(mb_count)
-            
-            # Extract learning rate from optimizer state
+
+            # Accumulate training metrics
+            for key, value in info.items():
+                if key not in accumulated_metrics:
+                    accumulated_metrics[key] = []
+                accumulated_metrics[key].append(value)
+
+        # Average the accumulated metrics
+        info = {}
+        for key, values in accumulated_metrics.items():
+            info[key] = float(np.mean(values))
+
+        # Add non-training metrics
+        info['total_rollouts'] = total_rollouts
+        if env.num_tasks != -1:
+            info['env_epochs'] = total_rollouts / env_num_tasks
+        info['rollout_iters_per_update'] = rollout_iters
+        info['global_step'] = step_idx
+        info['times/time_per_inference_iteration'] = (time.time() - t_start_roll) / max(rollout_iters, 1)
+        info['times/time_per_rollout'] = (time.time() - t_start_roll) / max(rollout_iters * rollout_batch_size * jax.host_count(), 1)
+        info['times/total_time_rollouts'] = time.time() - t_start_roll
+        info['times/total_time_update'] = time.time() - t_update_start
+        info['minibatches_per_global_step'] = int(mb_count)
+
+        # Extract learning rate from optimizer state
+        try:
+            if hasattr(train_state.opt_state, 'hyperparams'):
+                # AdamW-style optimizer
+                lr = float(train_state.opt_state.hyperparams.get('learning_rate', FLAGS.lr))
+            elif hasattr(train_state.opt_state, 'count'):
+                # Adafactor-style - use config LR
+                lr = float(FLAGS.lr)
+            else:
+                lr = float(FLAGS.lr)
+            info['training/learning_rate'] = lr
+        except Exception:
+            info['training/learning_rate'] = float(FLAGS.lr)
+        for k, v in env_infos_history.items():
+            if isinstance(v, (list, tuple)):
+                vals = v
+            else:
+                vals = list(v)
+            # avoid large text blobs in logs; only mean for numeric
             try:
-                if hasattr(train_state.opt_state, 'hyperparams'):
-                    # AdamW-style optimizer
-                    lr = float(train_state.opt_state.hyperparams.get('learning_rate', FLAGS.lr))
-                elif hasattr(train_state.opt_state, 'count'):
-                    # Adafactor-style - use config LR
-                    lr = float(FLAGS.lr)
-                else:
-                    lr = float(FLAGS.lr)
-                info['training/learning_rate'] = lr
+                vals_np = np.array(vals)
+                if vals_np.dtype.kind in {'i', 'u', 'f'}:
+                    info[f'env/{k}'] = float(np.mean(vals_np))
             except Exception:
-                info['training/learning_rate'] = float(FLAGS.lr)
-            for k, v in env_infos_history.items():
-                if isinstance(v, (list, tuple)):
-                    vals = v
-                else:
-                    vals = list(v)
-                # avoid large text blobs in logs; only mean for numeric
+                pass
+
+        # Enhanced response logging with W&B tables
+        if jax.process_index() == 0:
+            try:
+                responses = env_infos_history.get('response', [])
+                rewards = env_infos_history.get('return', [])
+                if responses and rewards and len(responses) == len(rewards):
+                    # Find best and worst samples
+                    rewards_arr = np.array(rewards)
+                    n_samples = min(5, len(rewards))  # Log top 5 and bottom 5
+
+                    # Get indices of best and worst
+                    best_idxs = np.argsort(rewards_arr)[-n_samples:][::-1]
+                    worst_idxs = np.argsort(rewards_arr)[:n_samples]
+
+                    # Build table data
+                    table_rows = []
+                    for idx in best_idxs:
+                        table_rows.append([
+                            int(step_idx),
+                            "best",
+                            float(rewards[idx]),
+                            str(responses[idx])[:500],  # Truncate long responses
+                            env_infos_history.get('predicted', [None] * len(rewards))[idx] if 'predicted' in env_infos_history else None,
+                        ])
+                    for idx in worst_idxs:
+                        table_rows.append([
+                            int(step_idx),
+                            "worst",
+                            float(rewards[idx]),
+                            str(responses[idx])[:500],
+                            env_infos_history.get('predicted', [None] * len(rewards))[idx] if 'predicted' in env_infos_history else None,
+                        ])
+
+                    if table_rows:
+                        response_table = wandb.Table(
+                            columns=['step', 'category', 'reward', 'response', 'predicted'],
+                            data=table_rows
+                        )
+                        info['samples/responses'] = response_table
+            except Exception as e:
+                # Keep non-fatal
+                pass
+
+            wandb.log(info)
+            # If building a viz snapshot, append a few numeric lines now that we have update stats
+            if snapshot is not None and snapshot.get('log_lines') is not None and len(snapshot['log_lines']) < 1:
                 try:
-                    vals_np = np.array(vals)
-                    if vals_np.dtype.kind in {'i', 'u', 'f'}:
-                        info[f'env/{k}'] = float(np.mean(vals_np))
+                    gn = float(info.get('grad_norm', 0.0))
+                    un = float(info.get('update_norm', 0.0))
+                    snapshot['grad_norm'] = gn
+                    snapshot['update_norm'] = un
+                    snapshot['log_lines'] += [
+                        f"baseline_mean_reward={snapshot.get('baseline_mean_reward', 0.0):.3f}",
+                        f"grad_norm={gn:.3f}",
+                        f"update_norm={un:.3f}",
+                    ]
                 except Exception:
                     pass
-            
-            # Enhanced response logging with W&B tables
-            if jax.process_index() == 0:
-                try:
-                    responses = env_infos_history.get('response', [])
-                    rewards = env_infos_history.get('return', [])
-                    if responses and rewards and len(responses) == len(rewards):
-                        # Find best and worst samples
-                        rewards_arr = np.array(rewards)
-                        n_samples = min(5, len(rewards))  # Log top 5 and bottom 5
-                        
-                        # Get indices of best and worst
-                        best_idxs = np.argsort(rewards_arr)[-n_samples:][::-1]
-                        worst_idxs = np.argsort(rewards_arr)[:n_samples]
-                        
-                        # Build table data
-                        table_rows = []
-                        for idx in best_idxs:
-                            table_rows.append([
-                                int(step_idx),
-                                "best",
-                                float(rewards[idx]),
-                                str(responses[idx])[:500],  # Truncate long responses
-                                env_infos_history.get('predicted', [None] * len(rewards))[idx] if 'predicted' in env_infos_history else None,
-                            ])
-                        for idx in worst_idxs:
-                            table_rows.append([
-                                int(step_idx),
-                                "worst",
-                                float(rewards[idx]),
-                                str(responses[idx])[:500],
-                                env_infos_history.get('predicted', [None] * len(rewards))[idx] if 'predicted' in env_infos_history else None,
-                            ])
-                        
-                        if table_rows:
-                            response_table = wandb.Table(
-                                columns=['step', 'category', 'reward', 'response', 'predicted'],
-                                data=table_rows
-                            )
-                            info['samples/responses'] = response_table
-                except Exception as e:
-                    # Keep non-fatal
-                    pass
-                
-                wandb.log(info)
-                # If building a viz snapshot, append a few numeric lines now that we have update stats
-                if snapshot is not None and snapshot.get('log_lines') is not None and len(snapshot['log_lines']) < 1:
-                    try:
-                        gn = float(info.get('grad_norm', 0.0))
-                        un = float(info.get('update_norm', 0.0))
-                        snapshot['grad_norm'] = gn
-                        snapshot['update_norm'] = un
-                        snapshot['log_lines'] += [
-                            f"baseline_mean_reward={snapshot.get('baseline_mean_reward', 0.0):.3f}",
-                            f"grad_norm={gn:.3f}",
-                            f"update_norm={un:.3f}",
-                        ]
-                    except Exception:
-                        pass
 
         # Finally, write snapshot JSON once per step (if requested)
         if snapshot is not None and jax.process_index() == 0:
