@@ -475,9 +475,17 @@ def main(_):
             if jax.process_index() == 0:
                 print(f"Buffer groups: {len(buffer_tokens)}. Return avg: {float(np.mean(returns)):.4f}")
 
-        # Construct global batch tensors (pad to right)
-        tokens_all = jnp.concatenate(buffer_tokens, axis=0)
-        inference_logprobs_all = _pad_right(buffer_inf_logprobs, pad_val=0.0, axis=1)
+        # Construct global batch tensors (pad to right across buffered groups)
+        # buffer_tokens elements are shape (group_size, T_i) with varying T_i.
+        # Pad along the token dimension (axis=1), then flatten groups to 2D.
+        tokens_all_3d = _pad_right(buffer_tokens, pad_val=pad_id, axis=1)
+        tokens_all = tokens_all_3d.reshape(-1, tokens_all_3d.shape[-1])
+
+        # Same treatment for inference logprobs so shapes match tokens_all.
+        inf_lp_3d = _pad_right(buffer_inf_logprobs, pad_val=0.0, axis=1)
+        inference_logprobs_all = inf_lp_3d.reshape(-1, inf_lp_3d.shape[-1])
+
+        # Advantages were collected as (group_size,) so concatenation is fine.
         advantages_all = jnp.concatenate(buffer_adv, axis=0)
         global_batch_size = int(FLAGS.groups_per_batch) * int(FLAGS.group_size)
         # Clip to exact global batch
