@@ -99,6 +99,7 @@ def eval_model(
                     min_pixels=(vlm_min_pixels if (vlm_min_pixels and vlm_min_pixels > 0) else DEFAULT_MIN_PIXELS),
                     max_pixels=(vlm_max_pixels if (vlm_max_pixels and vlm_max_pixels > 0) else DEFAULT_MAX_PIXELS),
                 )
+                # Encode vision on first device without sharding (batch=1)
                 vision_embeds = model.apply({"params": params}, pixel_values, grid_thw, method=model.encode_vision)
                 num_vision_tokens = int(vision_embeds.shape[0])
                 prompt_text = chat_prompt_with_image(num_vision_tokens, obs.question)
@@ -202,13 +203,25 @@ def eval_model(
         for k, v in env_infos.items():
             if k not in env_infos_history:
                 env_infos_history[k] = []
-            np_v = np.array(v)
-            # Only shard/gather numeric or boolean arrays; keep strings locally.
-            if np_v.dtype.kind in {"i", "u", "f", "b"}:
+            # We only shard/gather when we have a full local batch of simple numeric scalars.
+            full_batch_len = rollout_batch_size
+            current_len = len(v)
+            np_v = None
+            np_ok = False
+            # Try to form a 1D numeric array; otherwise treat as non-numeric or ragged.
+            try:
+                candidate = np.array(v)
+                if candidate.ndim == 1 and candidate.dtype.kind in {"i", "u", "f", "b"}:
+                    np_v = candidate
+                    np_ok = True
+            except Exception:
+                np_ok = False
+
+            if current_len == full_batch_len and np_ok:
                 v_global = host_gather(shard_data_fn(np_v))
                 env_infos_history[k] += v_global.tolist()
             else:
-                # Non-numeric (e.g., response text). Extend local list without device collect.
+                # Partial batches or non-scalar/ragged values: extend locally.
                 env_infos_history[k] += list(v)
         env_infos_history['return'] += returns.tolist()
     def _safe_numpy(x_list):
@@ -275,6 +288,10 @@ if __name__ == '__main__':
     # Sharding: 'dp' (replicate params) or 'fsdp' (shard params across devices)
     shard_mode = getattr(FLAGS, 'shard', 'dp') if hasattr(FLAGS, 'shard') else 'dp'
     params_shard, no_shard, data_shard, shard_data_fn = create_sharding(shard_mode, params)
+
+    # Replicate params across all devices for multi-GPU inference
+    # This is necessary for batch=1 sampling where we can't shard the batch dimension
+    params = jax.device_put(params, no_shard)
 
     # tokenizer for Qwen2.5-VL
     tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=False)

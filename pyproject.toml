@@ -33,6 +33,7 @@ dependencies = [
     "chex==0.1.89",
     "datasets>=4.1.1",
     "pycountry>=24.6.1",
+    "pillow>=11.3.0",
 ]
 
 [project.urls]

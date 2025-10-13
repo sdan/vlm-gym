@@ -143,6 +143,7 @@ class Sampler:
         cache = self._init_cache(tokens.shape[0], max_len)
         vision_embeds = jnp.asarray(vision_embeds, dtype=self._dtype)
 
+        # Use jax.jit without automatic sharding to avoid issues with batch=1 on multi-GPU
         @jax.jit
         def _prefill_vlm(params, tokens, vision_embeds, image_pad_id, cos, sin, mask, cache):
             logits, cache_out = self.model.apply(

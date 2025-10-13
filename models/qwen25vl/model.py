@@ -187,8 +187,9 @@ def get_rope_index(
 
         position_ids = jnp.ones((3, batch, seq_len), dtype=total_input_ids.dtype)
         mrope_position_deltas: list[jax.Array] = []
-        image_index = 0
-        video_index = 0
+        # Support either flat per-batch lists (N,3) or batched (B, N_i, 3)
+        image_index_global = 0
+        video_index_global = 0
 
         for i in range(batch):  # per-example pass
             ids = total_input_ids[i]
@@ -208,6 +209,8 @@ def get_rope_index(
             st = 0
             remain_images = image_nums
             remain_videos = video_nums
+            image_index_local = 0
+            video_index_local = 0
 
             for _ in range(image_nums + video_nums):  # walk chunks in order
                 if remain_images > 0:
@@ -231,9 +234,14 @@ def get_rope_index(
                         raise ValueError(
                             "image_grid_thw must be provided when image tokens are present"
                         )
-                    t, h, w = [int(x) for x in image_grid_thw[image_index]]
+                    # Select the proper grid entry depending on input layout
+                    if hasattr(image_grid_thw, 'ndim') and int(image_grid_thw.ndim) == 3:
+                        t, h, w = [int(x) for x in image_grid_thw[i, image_index_local]]
+                        image_index_local += 1
+                    else:
+                        t, h, w = [int(x) for x in image_grid_thw[image_index_global]]
+                        image_index_global += 1
                     second_per_grid_t = 0.0
-                    image_index += 1
                     remain_images -= 1
                     ed = ed_image
                 else:
@@ -241,12 +249,20 @@ def get_rope_index(
                         raise ValueError(
                             "video_grid_thw must be provided when video tokens are present"
                         )
-                    t, h, w = [int(x) for x in video_grid_thw[video_index]]
+                    if hasattr(video_grid_thw, 'ndim') and int(video_grid_thw.ndim) == 3:
+                        t, h, w = [int(x) for x in video_grid_thw[i, video_index_local]]
+                        video_index_local += 1
+                    else:
+                        t, h, w = [int(x) for x in video_grid_thw[video_index_global]]
+                        video_index_global += 1
                     if second_per_grid_ts is not None:
-                        second_per_grid_t = float(second_per_grid_ts[video_index])
+                        if hasattr(video_grid_thw, 'ndim') and int(video_grid_thw.ndim) == 3:
+                            idx = video_index_local - 1  # already incremented above
+                        else:
+                            idx = video_index_global - 1
+                        second_per_grid_t = float(second_per_grid_ts[idx])
                     else:
                         second_per_grid_t = 1.0
-                    video_index += 1
                     remain_videos -= 1
                     ed = ed_video
 

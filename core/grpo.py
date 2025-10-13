@@ -95,19 +95,50 @@ def _pad_right(arrs, pad_val, axis=1):
     """Right-pad variable-length sequences to a common length along `axis`.
 
     Accepts a list of 1D or 2D arrays (or jnp arrays). Returns a stacked jnp array.
+    More robust to scalars and 1D inputs by expanding dims as needed.
     """
-    arrays = [jnp.asarray(a) for a in arrs]
-    max_len = int(max(a.shape[axis] for a in arrays)) if arrays else 0
+    if not arrs:
+        # Return a minimal empty tensor; caller typically reshapes after
+        return jnp.zeros((0, 0), dtype=jnp.int32)
+
+    prepped = []
+    for idx, a in enumerate(arrs):
+        try:
+            arr = jnp.asarray(a)
+        except Exception as e:
+            raise TypeError(f"_pad_right: failed to convert item {idx} of type {type(a)} to array") from e
+
+        # Ensure the pad axis exists by expanding dims at the axis position.
+        while arr.ndim <= int(axis):
+            arr = jnp.expand_dims(arr, axis=axis)
+
+        prepped.append(arr)
+
+    # Compute target length along the pad axis
+    try:
+        max_len = int(max(a.shape[axis] for a in prepped))
+    except IndexError as e:
+        shapes = [tuple(a.shape) for a in prepped]
+        raise IndexError(f"_pad_right: axis {axis} out of range for shapes {shapes}") from e
+
     padded = []
-    for a in arrays:
-        pad_shape = list(a.shape)
-        pad_shape[axis] = max_len - a.shape[axis]
-        if pad_shape[axis] < 0:
+    for arr in prepped:
+        # Verify other dims match so stacking is possible
+        other_shape = arr.shape[:axis] + arr.shape[axis + 1 :]
+        # Build pad spec: only pad the target axis to max_len
+        pad_amt = max_len - int(arr.shape[axis])
+        if pad_amt < 0:
             raise ValueError("_pad_right received an array longer than max_len")
-        pad_spec = [(0, 0)] * a.ndim
-        pad_spec[axis] = (0, pad_shape[axis])
-        padded.append(jnp.pad(a, pad_spec, constant_values=pad_val))
-    return jnp.stack(padded, axis=0) if len(padded) > 0 else jnp.zeros((0, max_len), dtype=jnp.int32)
+        pad_spec = [(0, 0)] * arr.ndim
+        pad_spec[axis] = (0, pad_amt)
+        padded.append(jnp.pad(arr, pad_spec, constant_values=pad_val))
+
+    # Stack along a new leading batch axis
+    try:
+        return jnp.stack(padded, axis=0)
+    except Exception as e:
+        shapes = [tuple(a.shape) for a in padded]
+        raise ValueError(f"_pad_right: cannot stack arrays with shapes {shapes} (axis={axis})") from e
 
 
 def _maybe_limit(val, default):
@@ -128,6 +159,35 @@ def main(_):
             name=f"{FLAGS.env_name}-{FLAGS.wandb_name}",
             group=FLAGS.wandb_group,
         )
+        # Define a common x-axis and summaries so charts are consistent in W&B
+        try:
+            wandb.define_metric('global_step')
+            wandb.define_metric('*', step_metric='global_step')
+            # Task performance
+            wandb.define_metric('env/stage_acc', summary='max')
+            wandb.define_metric('env/is_correct', summary='max')
+            wandb.define_metric('env/country_correct', summary='mean')
+            wandb.define_metric('env/region_correct', summary='mean')
+            wandb.define_metric('env/city_correct', summary='mean')
+            wandb.define_metric('env/any_correct', summary='mean')
+            # Coordinates and distance
+            wandb.define_metric('env/distance_km', summary='mean')
+            wandb.define_metric('env/coords_within_tolerance', summary='mean')
+            # Structure & parsing
+            wandb.define_metric('env/format_ok', summary='mean')
+            wandb.define_metric('env/parsed_field_count', summary='mean')
+            # Reward & curriculum
+            wandb.define_metric('env/final_reward', summary='mean')
+            wandb.define_metric('env/hier_reward', summary='mean')
+            wandb.define_metric('env/geo_reward', summary='mean')
+            wandb.define_metric('env/stage_idx', summary='last')
+        except Exception:
+            pass
+        # Test wandb logging immediately
+        print("[WANDB DEBUG] Testing initial wandb.log...")
+        # Do not advance W&B step before training starts; buffer this entry
+        wandb.log({"test/initial_log": 1.0, "test/startup_time": time.time()}, commit=False)
+        print("[WANDB DEBUG] Initial test log completed")
 
     # Load model and optimizer
     ckpt_dir = FLAGS.model_dir
@@ -157,6 +217,11 @@ def main(_):
     train_state_shape = jax.eval_shape(lambda ts: ts, train_state)
     train_state_shard, no_shard, data_shard, shard_data_fn = create_sharding(shard_mode, train_state_shape)
 
+    # Replicate train_state across all devices for multi-GPU with DP mode
+    # This avoids sharding issues with batch=1 sampling during rollouts
+    if shard_mode == 'dp':
+        train_state = jax.device_put(train_state, no_shard)
+
     # Tokenizer and env
     tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=False)
     pad_id = getattr(tokenizer, 'pad_token_id', None) or 0
@@ -185,45 +250,28 @@ def main(_):
     env_task_idx = 0
 
     # JIT compute of token logprobs under current params (teacher-forced)
-    def build_get_logprobs_fn(model: Qwen25VLModel):
+    def build_get_logprobs_core(model: Qwen25VLModel):
         @partial(jax.jit, out_shardings=no_shard)
-        def get_logprobs(state: TrainState, token_batch, mask, vision_embeds, grid_thw):
+        def get_logprobs_core(state: TrainState, token_batch, mask, vision_embeds, cos, sin):
             # token_batch: [B, T]
             text_input = token_batch[:, :-1]
             text_target = token_batch[:, 1:]
             mask_target = mask[:, 1:]  # align with targets
             attn_mask = (text_input != pad_id).astype(jnp.int32)
-            # Build mRoPE indices for interleaved tokens
-            pos3, _ = get_rope_index(
-                spatial_merge_size=model.spec.vision.spatial_merge_size,
-                input_ids=text_input,
-                image_grid_thw=grid_thw,
-                video_grid_thw=None,
-                second_per_grid_ts=None,
-                attention_mask=attn_mask,
-                tokens_per_second=float(model.spec.vision.tokens_per_second),
-            )
-            cos, sin = build_mrope(
-                pos3,
-                tuple(model.spec.text.rope_section),
-                float(model.spec.text.rope_theta),
-                dtype=model.dtype,
-                rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
-                rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
-            )
-            # Forward with vision injection
             logits, _ = state.call_model(text_input, vision_embeds, image_pad_id, cos, sin, mask=attn_mask, cache=None, method=model.forward_vlm)
             logprobs = jax.nn.log_softmax(logits, axis=-1)
             token_logprobs = jnp.sum(logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
             # return full sequence logprobs (masked by caller)
             return token_logprobs * mask_target
 
-        return get_logprobs
+        return get_logprobs_core
 
-    get_logprobs = build_get_logprobs_fn(model)
+    get_logprobs_core = build_get_logprobs_core(model)
 
     # Main training loop
     for step_idx in tqdm.tqdm(range(int(FLAGS.total_steps))):
+        if step_idx == 0 and jax.process_index() == 0:
+            print("[WANDB DEBUG] Starting training loop, first step...")
         # On-policy buffer
         buffer_tokens: list[jnp.ndarray] = []
         buffer_adv: list[jnp.ndarray] = []
@@ -329,7 +377,17 @@ def main(_):
                 action_tokens_list.append(gen_list)
                 action_lens_list.append(len(gen_list))
                 prompt_lens_list.append(int(prompt_tokens.shape[1]))
+                # Validate and normalize shapes before caching
+                if embeds.ndim != 2:
+                    raise ValueError(f"encode_vision must return 2D [N,D] embeds, got {embeds.shape}")
                 vis_embeds_list.append(embeds)
+                if isinstance(grid, (list, tuple)):
+                    grid = jnp.asarray(grid)
+                if hasattr(grid, 'ndim'):
+                    if grid.ndim == 1 and int(grid.size) == 3:
+                        grid = grid[None, :]
+                    if grid.ndim != 2 or int(grid.shape[-1]) != 3:
+                        raise ValueError(f"grid_thw must be shape (num_images,3), got {tuple(grid.shape)}")
                 grid_list.append(grid)
 
                 all_tokens = jnp.concatenate([prompt_tokens, generated], axis=-1)
@@ -339,20 +397,42 @@ def main(_):
                 all_logprobs = jnp.concatenate([zeros, logprobs[0]], axis=0)
                 all_logprobs_list.append(all_logprobs)
 
+                # embeds shape already validated above
+
             # Step environment
             new_states, _, returns_local, dones, env_infos = env.step_list(group_env_states, action_tokens_list)
             assert dones[0]
             returns_local = np.array(returns_local)
             returns = host_gather(shard_data_fn(returns_local))
 
+            # Only shard-gather values that are per-sample and align with device count.
             for k, v in env_infos.items():
                 env_infos_history.setdefault(k, [])
-                np_v = np.array(v)
-                if np_v.dtype.kind in {'i', 'u', 'f', 'b'}:
-                    v_global = host_gather(shard_data_fn(np_v))
-                    env_infos_history[k] += v_global.tolist()
-                else:
-                    env_infos_history[k] += list(v)
+                try:
+                    # Convert to list and detect scalar numerics
+                    seq = list(v) if isinstance(v, (list, tuple)) else [v]
+                    # Treat as numeric only if all elements are scalars (int/float/bool)
+                    def _is_scalar_number(x):
+                        return isinstance(x, (int, float, bool, np.number)) and not isinstance(x, (list, tuple))
+                    is_numeric_seq = all(_is_scalar_number(x) for x in seq)
+
+                    expected_len = len(group_obs)
+                    can_shard = (
+                        is_numeric_seq and len(seq) == expected_len and expected_len > 0 and
+                        (expected_len % jax.device_count() == 0)
+                    )
+                    if can_shard:
+                        np_v = np.asarray(seq)
+                        v_global = host_gather(shard_data_fn(np_v))
+                        env_infos_history[k] += v_global.tolist()
+                    else:
+                        env_infos_history[k] += seq
+                except Exception:
+                    # Fallback to plain list extension to keep training robust
+                    try:
+                        env_infos_history[k] += list(v)
+                    except Exception:
+                        pass
             env_infos_history['return'] += returns.tolist()
 
             # Optional debug print/log of a few samples
@@ -440,30 +520,39 @@ def main(_):
             adv_grouped = adv.reshape(-1, int(FLAGS.group_size))
             tokens_grouped = all_tokens_arr.reshape(-1, int(FLAGS.group_size), all_tokens_arr.shape[-1])
             logprobs_grouped = all_logprobs_arr.reshape(-1, int(FLAGS.group_size), all_logprobs_arr.shape[-1])
-            prompt_lens_grouped = np.array(prompt_lens_list).reshape(-1, int(FLAGS.group_size))
-            action_lens_grouped = np.array(action_lens_list).reshape(-1, int(FLAGS.group_size))
-            vis_embeds_grouped = np.array(vis_embeds_list, dtype=object).reshape(-1, int(FLAGS.group_size))
-            grid_grouped = np.array(grid_list, dtype=object).reshape(-1, int(FLAGS.group_size))
+            # For scalar lists, manual indexing is safer than object np.reshape
+            # Keep prompt/action lens as flat lists and index via base_idx
+            # Preserve vision embeddings and grid_thw as JAX arrays by avoiding np.reshape on object arrays
             returns_grouped = np.array(returns).reshape(-1, int(FLAGS.group_size))
 
             # Capture per-sample env outputs for this rollout
             responses = env_infos.get('response', [''] * len(group_obs)) if isinstance(env_infos, dict) else [''] * len(group_obs)
             predicted_flags = env_infos.get('predicted', [None] * len(group_obs)) if isinstance(env_infos, dict) else [None] * len(group_obs)
 
-            for g in range(adv_grouped.shape[0]):
+            group_size_val = int(FLAGS.group_size)
+            num_groups = int(adv_grouped.shape[0])
+            for g in range(num_groups):
                 if int(FLAGS.do_group_filter) and np.all(adv_grouped[g] == 0):
                     continue
                 buffer_tokens.append(tokens_grouped[g])
                 buffer_adv.append(adv_grouped[g])
                 buffer_inf_logprobs.append(logprobs_grouped[g])
-                buffer_prompt_lens.append(int(prompt_lens_grouped[g, 0]))  # same per group
-                buffer_action_lens.append(int(action_lens_grouped[g, 0]))  # same per group
+                base_idx = g * group_size_val
+                buffer_prompt_lens.append(int(prompt_lens_list[base_idx]))  # same per group
+                buffer_action_lens.append(int(action_lens_list[base_idx]))  # same per group
                 # store one set per group (identical across members)
-                buffer_vis_embeds.append(vis_embeds_grouped[g, 0])
-                buffer_grid_thw.append(grid_grouped[g, 0])
+                buffer_vis_embeds.append(vis_embeds_list[base_idx])
+                # Normalize grid_thw to at least 2D (num_images, 3)
+                _grid = grid_list[base_idx]
+                try:
+                    _grid_arr = jnp.asarray(_grid)
+                    if _grid_arr.ndim == 1 and _grid_arr.size == 3:
+                        _grid_arr = _grid_arr[None, :]
+                except Exception:
+                    _grid_arr = _grid  # keep original; _pad_right will surface details if problematic
+                buffer_grid_thw.append(_grid_arr)
                 # snapshot meta (use the first obs of this group)
                 try:
-                    base_idx = g * int(FLAGS.group_size)
                     o = group_obs[base_idx]
                     meta = {
                         'statement': getattr(o, 'statement', ''),
@@ -494,11 +583,9 @@ def main(_):
 
         # Advantages were collected as (group_size,) so concatenation is fine.
         advantages_all = jnp.concatenate(buffer_adv, axis=0)
-        global_batch_size = int(FLAGS.groups_per_batch) * int(FLAGS.group_size)
-        # Clip to exact global batch
-        tokens_all = tokens_all[:global_batch_size]
-        advantages_all = advantages_all[:global_batch_size]
-        inference_logprobs_all = inference_logprobs_all[:global_batch_size]
+
+        # Derive actual batch size from what we buffered (robust to filtering)
+        global_batch_size = int(tokens_all.shape[0])
 
         # Build generation mask per-sample (only learned on generated tokens)
         prompt_lens_arr = np.array(buffer_prompt_lens, dtype=np.int32)
@@ -540,7 +627,27 @@ def main(_):
             tokens_mb = tokens_all[st:ed]
             mask_mb = mask[st:ed]
             embeds_mb, grid_mb = pack_vision_samples(idxs)
-            recalc = get_logprobs(train_state, tokens_mb, mask_mb, embeds_mb, grid_mb)
+            # Precompute cos/sin outside jit for JAX-safety
+            text_input_mb = tokens_mb[:, :-1]
+            token_mask_mb = (text_input_mb != pad_id).astype(jnp.int32)
+            pos3_mb, _ = get_rope_index(
+                spatial_merge_size=model.spec.vision.spatial_merge_size,
+                input_ids=text_input_mb,
+                image_grid_thw=grid_mb,
+                video_grid_thw=None,
+                second_per_grid_ts=None,
+                attention_mask=token_mask_mb,
+                tokens_per_second=float(model.spec.vision.tokens_per_second),
+            )
+            cos_mb, sin_mb = build_mrope(
+                pos3_mb,
+                tuple(model.spec.text.rope_section),
+                float(model.spec.text.rope_theta),
+                dtype=model.dtype,
+                rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
+                rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
+            )
+            recalc = get_logprobs_core(train_state, tokens_mb, mask_mb, embeds_mb, cos_mb, sin_mb)
             recalc_chunks.append(recalc)
         recalc_logprobs_all = jnp.concatenate(recalc_chunks, axis=0)
 
@@ -631,7 +738,7 @@ def main(_):
 
         # JIT PPO update using text-style objective but VLM logprobs
         @partial(jax.jit, out_shardings=(train_state_shard, None))
-        def update(state: TrainState, token_batch, mask_origin, advantages, recalc_logprobs, inference_logprobs, vision_embeds_mb, grid_thw_mb):
+        def update(state: TrainState, token_batch, mask_origin, advantages, recalc_logprobs, inference_logprobs, vision_embeds_mb, cos_mb, sin_mb):
             text_input, text_target = token_batch[:, :-1], token_batch[:, 1:]
             inference_logprobs = inference_logprobs[:, 1:]
             mask_origin = mask_origin[:, 1:]
@@ -639,24 +746,7 @@ def main(_):
 
             def loss_fn(grad_params):
                 # Recompute logits (teacher-forced)
-                pos3, _ = get_rope_index(
-                    spatial_merge_size=model.spec.vision.spatial_merge_size,
-                    input_ids=text_input,
-                    image_grid_thw=grid_thw_mb,
-                    video_grid_thw=None,
-                    second_per_grid_ts=None,
-                    attention_mask=token_mask,
-                    tokens_per_second=float(model.spec.vision.tokens_per_second),
-                )
-                cos, sin = build_mrope(
-                    pos3,
-                    tuple(model.spec.text.rope_section),
-                    float(model.spec.text.rope_theta),
-                    dtype=model.dtype,
-                    rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
-                    rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
-                )
-                logits, _ = state.call_model(text_input, vision_embeds_mb, image_pad_id, cos, sin, mask=token_mask, cache=None, params=grad_params, method=model.forward_vlm)
+                logits, _ = state.call_model(text_input, vision_embeds_mb, image_pad_id, cos_mb, sin_mb, mask=token_mask, cache=None, params=grad_params, method=model.forward_vlm)
                 all_logprobs = jax.nn.log_softmax(logits)
                 token_logprobs = jnp.sum(all_logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
                 entropy = -jnp.sum(jax.nn.softmax(logits) * all_logprobs, axis=-1)
@@ -723,6 +813,26 @@ def main(_):
             inf_lp_mb = inference_logprobs_all[st:ed]
             recalc_mb = recalc_logprobs_all[st:ed]
             embeds_mb, grid_mb = pack_vision_samples(idxs)
+            # Precompute cos/sin outside jit to avoid dynamic boolean indexing
+            text_input_mb = tokens_mb[:, :-1]
+            token_mask_mb = (text_input_mb != pad_id).astype(jnp.int32)
+            pos3_mb, _ = get_rope_index(
+                spatial_merge_size=model.spec.vision.spatial_merge_size,
+                input_ids=text_input_mb,
+                image_grid_thw=grid_mb,
+                video_grid_thw=None,
+                second_per_grid_ts=None,
+                attention_mask=token_mask_mb,
+                tokens_per_second=float(model.spec.vision.tokens_per_second),
+            )
+            cos_mb, sin_mb = build_mrope(
+                pos3_mb,
+                tuple(model.spec.text.rope_section),
+                float(model.spec.text.rope_theta),
+                dtype=model.dtype,
+                rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
+                rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
+            )
             train_state, info = update(
                 train_state,
                 tokens_mb,
@@ -731,7 +841,8 @@ def main(_):
                 recalc_mb,
                 inf_lp_mb,
                 embeds_mb,
-                grid_mb,
+                cos_mb,
+                sin_mb,
             )
             info = jax.device_get(info)
             info = jax.tree.map(lambda x: np.array(x), info)
@@ -829,7 +940,12 @@ def main(_):
                 # Keep non-fatal
                 pass
 
-            wandb.log(info)
+            print(f"[WANDB DEBUG] Step {step_idx}: About to log {len(info)} metrics to wandb")
+            print(f"[WANDB DEBUG] Sample metrics: loss={info.get('loss', 'N/A'):.4f}, lr={info.get('training/learning_rate', 'N/A')}")
+            print(f"[WANDB DEBUG] wandb.run active: {wandb.run is not None}")
+            # Rely on 'global_step' metric for x-axis; avoid passing 'step' to keep steps monotonic
+            wandb.log(info, commit=True)
+            print(f"[WANDB DEBUG] wandb.log() completed for step {step_idx}")
             # If building a viz snapshot, append a few numeric lines now that we have update stats
             if snapshot is not None and snapshot.get('log_lines') is not None and len(snapshot['log_lines']) < 1:
                 try:

@@ -385,6 +385,9 @@ class OSV5MEnv(BaseEnv):
             "mode": stage,
             "reward_stage": stage,
             "reward_weights": dict(weights),
+            # Numeric lengths for aggregation in trainer
+            "response_len_chars": int(len(response_text)),
+            "response_len_tokens": int(len(action_tokens)),
         }
 
         # Always add ground truth to info for debugging
@@ -414,16 +417,19 @@ class OSV5MEnv(BaseEnv):
         gt_region_norm = self._normalize_region_or_city(gt_region) if gt_region else None
         gt_city_norm = self._normalize_region_or_city(gt_city) if gt_city else None
 
-        # Hierarchical score
+        # Hierarchical score + per-target correctness flags
         hier = 0.0
         active_country_weight = float(weights.get("country", self.target_weights["country"]))
         active_region_weight = float(weights.get("region", 0.0))
         active_city_weight = float(weights.get("city", 0.0))
-        if pred_country and gt_country_norm and pred_country == gt_country_norm:
+        country_correct = int(1 if (pred_country and gt_country_norm and pred_country == gt_country_norm) else 0)
+        region_correct = int(1 if (pred_region and gt_region_norm and pred_region == gt_region_norm) else 0)
+        city_correct = int(1 if (pred_city and gt_city_norm and pred_city == gt_city_norm) else 0)
+        if country_correct:
             hier += max(active_country_weight, 0.0)
-        if pred_region and gt_region_norm and pred_region == gt_region_norm:
+        if region_correct:
             hier += max(active_region_weight, 0.0)
-        if pred_city and gt_city_norm and pred_city == gt_city_norm:
+        if city_correct:
             hier += max(active_city_weight, 0.0)
 
         # Distance shaping if lat/lon present
@@ -436,7 +442,18 @@ class OSV5MEnv(BaseEnv):
                 r_geo = exp(-float(distance_km) / max(self.geo_decay_km, 1e-6))
                 info["predicted_coords"] = (float(pred_lat), float(pred_lon))
                 info["distance_km"] = float(distance_km)
+                info["coords_in_range"] = int(1)
+            else:
+                info["coords_in_range"] = int(0)
         info["correct_coords"] = (state.latitude, state.longitude)
+        # Coordinate presence/tolerance metrics
+        has_coords = int(isinstance(pred_lat, (int, float)) and isinstance(pred_lon, (int, float)))
+        info["has_coords"] = has_coords
+        if has_coords and "distance_km" in info:
+            info["coords_within_tolerance"] = int(float(info["distance_km"]) <= float(self.coord_tolerance_km))
+        else:
+            info["coords_within_tolerance"] = int(0)
+        info["coord_tolerance_km"] = float(self.coord_tolerance_km)
 
         # Final reward components
         if self.use_geo_shaping and r_geo is not None:
@@ -451,8 +468,41 @@ class OSV5MEnv(BaseEnv):
             info["format_bonus"] = float(format_bonus)
             info["format_sources"] = sorted(format_sources)
             info["structured_fields"] = sorted(parsed_fields)
+        # Numeric flags for formatting & parsing
+        info["format_ok"] = int(1 if (format_sources and len(parsed_fields) >= 2) else 0)
+        info["parsed_field_count"] = int(len(parsed_fields))
+        info["has_country"] = int(1 if (parsed.get("country") is not None) else 0)
+        info["has_region"] = int(1 if (parsed.get("region") is not None) else 0)
+        info["has_city"] = int(1 if (parsed.get("city") is not None) else 0)
+        # Country value validity after normalization (did it map to ISO-2?)
+        info["country_valid"] = int(1 if (parsed.get("country") is not None and pred_country is not None) else 0)
 
         reward = float(max(min(reward + format_bonus, 1.0), 0.0))
+        # Reward component & stage logging (numeric for aggregation)
+        info["hier_reward"] = float(hier)
+        info["geo_reward"] = float(r_geo) if r_geo is not None else float(0.0)
+        info["final_reward"] = float(reward)
+        stage_label = str(stage).lower() if isinstance(stage, str) else str(stage)
+        stage_to_idx = {"country": 0, "region": 1, "city": 2, "coords": 3, "full": 9, "custom": 8}
+        info["stage_idx"] = int(stage_to_idx.get(stage_label, 9))
+        info["stage_country_weight"] = float(active_country_weight)
+        info["stage_region_weight"] = float(active_region_weight)
+        info["stage_city_weight"] = float(active_city_weight)
+        info["country_correct"] = int(country_correct)
+        info["region_correct"] = int(region_correct)
+        info["city_correct"] = int(city_correct)
+        info["any_correct"] = int(1 if (country_correct or region_correct or city_correct) else 0)
+        if active_region_weight <= 0 and active_city_weight <= 0:
+            stage_acc = int(country_correct)
+        elif active_city_weight <= 0:
+            stage_acc = int(region_correct)
+        elif active_city_weight > 0:
+            stage_acc = int(city_correct)
+        else:
+            stage_acc = int(info.get("coords_within_tolerance", 0))
+        info["stage_acc"] = int(stage_acc)
+        # Backward/standard alias for overall correctness under current stage
+        info["is_correct"] = int(stage_acc)
 
         # Per-mode logging of predicted/correct for eval clarity
         if active_region_weight <= 0 and active_city_weight <= 0:
@@ -569,7 +619,8 @@ class OSV5MEnv(BaseEnv):
     def _normalize_region_or_city(self, s: Optional[str]) -> Optional[str]:
         """Normalize region/city name to canonical form for comparison.
 
-        Handles diacritics, case, and whitespace normalization.
+        Handles diacritics, case, whitespace, and common alias canonicalization
+        (e.g., "St. Petersburg" -> "saint petersburg").
         """
         if s is None:
             return None
@@ -580,6 +631,11 @@ class OSV5MEnv(BaseEnv):
         x = x.strip().lower()
         # Remove common prefixes
         x = re.sub(r"^(state of|province of|community of|autonomous community of|region of|county of|city of)\s+", "", x)
+        # Expand common abbreviations
+        x = re.sub(r"\bst\.?\s+", "saint ", x)
+        x = re.sub(r"\bsankt\s+", "saint ", x)
+        # Normalize punctuation variants
+        x = x.replace('-', ' ')
         # Collapse whitespace
         x = re.sub(r"\s+", " ", x)
         return x
