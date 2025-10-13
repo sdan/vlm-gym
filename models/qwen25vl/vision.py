@@ -29,7 +29,9 @@ class VisionRotaryEmbedding(nn.Module):
 
     def __call__(self, seq_len: int) -> jax.Array:
         # 1D rope table for ViT
-        inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
+        # Use half-dim directly: produce self.dim distinct frequencies.
+        # This pairs with a later duplication to reach full head_dim.
+        inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, dtype=jnp.float32) / self.dim))
         positions = jnp.arange(seq_len, dtype=jnp.float32)
         return jnp.outer(positions, inv_freq)
 
@@ -71,8 +73,13 @@ class VisionAttention(nn.Module):
         k = k.reshape(seq_len, self.num_heads, self.head_dim)
         v = v.reshape(seq_len, self.num_heads, self.head_dim)
 
-        cos = cos.astype(self.dtype)[:, None, :]
-        sin = sin.astype(self.dtype)[:, None, :]
+        # cos/sin have shape (seq_len, 2*head_dim) due to duplication
+        # We need to take only the first head_dim elements to match q/k shape
+        cos = cos.astype(self.dtype)[:, :self.head_dim]
+        sin = sin.astype(self.dtype)[:, :self.head_dim]
+        # Expand for broadcasting with (seq_len, num_heads, head_dim)
+        cos = cos[:, None, :]
+        sin = sin[:, None, :]
         q_embed = q * cos + rotate_half(q) * sin
         k_embed = k * cos + rotate_half(k) * sin
 
@@ -281,13 +288,15 @@ class Qwen25VisionTransformer(nn.Module):
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len // spatial_merge_unit, spatial_merge_unit, -1)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :].reshape(seq_len, -1)
 
-        emb = jnp.concatenate([rotary_pos_emb, rotary_pos_emb], axis=-1)  # duplicate dims
+        # Duplicate half-dim angles to match full head_dim (rotate_half expects full dim).
+        emb = jnp.concatenate([rotary_pos_emb, rotary_pos_emb], axis=-1)
         cos = jnp.cos(emb).astype(self.dtype)
         sin = jnp.sin(emb).astype(self.dtype)
 
         cu_seqlens_list = []
+        spatial_merge_unit = self.spec.spatial_merge_size ** 2
         for grid_t, grid_h, grid_w in grid_thw:
-            cu_seqlens_list.append(int(grid_t * grid_h * grid_w))
+            cu_seqlens_list.append(int(grid_t * grid_h * grid_w * spatial_merge_unit))
         cu_seqlens = jnp.cumsum(jnp.array(cu_seqlens_list, dtype=jnp.int32))
         cu_seqlens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), cu_seqlens])
 

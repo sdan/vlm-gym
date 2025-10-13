@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Optional, Union
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -25,9 +25,7 @@ except Exception:
 
 from vlmrl.models.qwen25vl import (
     KVCache,
-    MRopeCtx,
     Qwen25VLModel,
-    TextRopeCtx,
     build_mrope,
     build_text_rope,
     get_rope_index,
@@ -51,6 +49,8 @@ class Sampler:
         text_spec = model.spec.text
         self._rope_section = tuple(text_spec.rope_section)
         self._rope_theta = float(text_spec.rope_theta)
+        self._rope_scaling_type = getattr(text_spec, "rope_scaling_type", None)
+        self._rope_scaling_factor = getattr(text_spec, "rope_scaling_factor", None)
         self._dtype = model.dtype
         # derived hyperparams for cache shape
         self._num_layers = text_spec.num_hidden_layers
@@ -73,13 +73,20 @@ class Sampler:
         prompt_tokens: np.ndarray | jnp.ndarray,
         pad_id: int,
         max_cache_len: Optional[int] = None,
-    ) -> KVCache:
+    ) -> tuple[KVCache, jnp.ndarray]:
         tokens = jnp.asarray(prompt_tokens, dtype=jnp.int32)
         if tokens.ndim != 2:
             raise ValueError("prompt_tokens must have shape [batch, seq]")
         # standard text-only prefill
         positions, mask = token_positions(tokens, pad_id)
-        cos, sin = build_text_rope(positions, self._rope_section, self._rope_theta, dtype=self._dtype)
+        cos, sin = build_text_rope(
+            positions,
+            self._rope_section,
+            self._rope_theta,
+            dtype=self._dtype,
+            rope_scaling_type=self._rope_scaling_type,
+            rope_scaling_factor=self._rope_scaling_factor,
+        )
         cache = self._init_cache(tokens.shape[0], max_cache_len or tokens.shape[1])
 
         @jax.jit
@@ -95,7 +102,9 @@ class Sampler:
             )
             return cache_out
 
-        return _prefill(self.params, tokens, cos, sin, mask, cache)
+        cache_out = _prefill(self.params, tokens, cos, sin, mask, cache)
+        rope_deltas = jnp.zeros((tokens.shape[0], 1), dtype=jnp.int32)
+        return cache_out, rope_deltas
 
     def prefill_vlm(
         self,
@@ -122,7 +131,14 @@ class Sampler:
             attention_mask=mask,
             tokens_per_second=float(self.model.spec.vision.tokens_per_second),
         )
-        cos, sin = build_mrope(pos3, self._rope_section, self._rope_theta, dtype=self._dtype)
+        cos, sin = build_mrope(
+            pos3,
+            self._rope_section,
+            self._rope_theta,
+            dtype=self._dtype,
+            rope_scaling_type=self._rope_scaling_type,
+            rope_scaling_factor=self._rope_scaling_factor,
+        )
         max_len = max_cache_len or tokens.shape[1]  # quick cap
         cache = self._init_cache(tokens.shape[0], max_len)
         vision_embeds = jnp.asarray(vision_embeds, dtype=self._dtype)
@@ -145,7 +161,8 @@ class Sampler:
         logits, cache = _prefill_vlm(
             self.params, tokens, vision_embeds, image_pad_id, cos, sin, mask, cache
         )
-        return logits, cache, deltas
+        rope_deltas = deltas.astype(jnp.int32)
+        return logits, cache, rope_deltas
 
     def decode_loop(
         self,
@@ -157,7 +174,7 @@ class Sampler:
         top_p: Optional[float],
         eos_id: Optional[int],
         top_k: Optional[int] = None,
-        rope_ctx: Union[TextRopeCtx, MRopeCtx],
+        rope_deltas: Optional[jnp.ndarray],
         rng: jax.Array,
         return_logprobs: bool = False,
     ) -> tuple[jnp.ndarray, Optional[jnp.ndarray]]:
@@ -178,16 +195,23 @@ class Sampler:
         topp_val_py = (
             float(top_p) if (top_p is not None and 0.0 < float(top_p) < 1.0) else None
         )
+        batch_size = cache.lengths.shape[0]
+        if rope_deltas is None:
+            rope_offsets = jnp.zeros((batch_size, 1), dtype=jnp.int32)
+        else:
+            rope_offsets = jnp.asarray(rope_deltas, dtype=jnp.int32)
 
-        def _one_step(params, rope_ctx, carry, _):
-            # one decode step
+        def _one_step(params, offsets, carry, _):
             cache_state, current_tok, rng_state, stopped = carry
             rng_state, step_key = jax.random.split(rng_state)
+            # Prevent finished sequences from extending KV/positions by passing a 0 mask.
+            step_mask = (jnp.logical_not(stopped)).astype(jnp.int32)[:, None]
             logits, cache_state = self.model.apply(
                 {"params": params},
                 current_tok,
                 cache_state,
-                rope_ctx,
+                offsets,
+                step_mask,
                 method=self.model.decode_step,
             )
             logits = logits.astype(jnp.float32) / temp  # apply temperature
@@ -211,20 +235,21 @@ class Sampler:
             return carry_out, y
 
         @jax.jit  # pack scan for speed
-        def _scan_decode(params, rope_ctx, cache_init, first_tok_init, rng_init):
+        def _scan_decode(params, offsets, cache_init, first_tok_init, rng_init):
             init_carry = (
                 cache_init,
                 first_tok_init.astype(jnp.int32),
                 rng_init,
                 jnp.zeros_like(first_tok_init, dtype=jnp.bool_),
             )
-            carry_out, ys = jax.lax.scan(
-                lambda c, _x: _one_step(params, rope_ctx, c, _x), init_carry, xs=None, length=int(steps)
-            )
+            def _body(carry, _):
+                return _one_step(params, offsets, carry, _)
+
+            carry_out, ys = jax.lax.scan(_body, init_carry, xs=None, length=int(steps))
             tokens_seq, logprobs_seq = ys  # each is (steps, batch)
             return tokens_seq.transpose(1, 0), logprobs_seq.transpose(1, 0)
 
-        tokens_seq, logprobs_seq = _scan_decode(self.params, rope_ctx, cache, first_token, rng)
+        tokens_seq, logprobs_seq = _scan_decode(self.params, rope_offsets, cache, first_token, rng)
         if return_logprobs:
             return tokens_seq, logprobs_seq
         return tokens_seq, None
@@ -246,11 +271,12 @@ class Sampler:
         if tokens.ndim != 2:
             raise ValueError("prompt_tokens must have shape [batch, seq]")
         # text path
-        cache = self.prefill_text(tokens, pad_id, max_cache_len=tokens.shape[1] + max_new_tokens)
+        cache, rope_deltas = self.prefill_text(
+            tokens, pad_id, max_cache_len=tokens.shape[1] + max_new_tokens
+        )
         lengths = cache.lengths.astype(jnp.int32)
         last_token_idx = jnp.maximum(lengths - 1, 0)
         last_token = jnp.take_along_axis(tokens, last_token_idx[:, None], axis=1).squeeze(1)
-        rope_ctx = TextRopeCtx(self._rope_section, self._rope_theta, dtype=self._dtype)
         return self.decode_loop(
             cache,
             last_token,
@@ -259,7 +285,7 @@ class Sampler:
             top_p=top_p,
             top_k=top_k,
             eos_id=eos_id,
-            rope_ctx=rope_ctx,
+            rope_deltas=rope_deltas,
             rng=rng,
             return_logprobs=return_logprobs,
         )
@@ -283,7 +309,7 @@ class Sampler:
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be at least 1")
 
-        logits, cache, deltas = self.prefill_vlm(
+        logits, cache, rope_deltas = self.prefill_vlm(
             prompt_tokens,
             vision_embeds,
             image_pad_id,
@@ -303,8 +329,6 @@ class Sampler:
         else:
             first_logprob = None
 
-        # dynamic mRoPE context using computed deltas
-        rope_ctx = MRopeCtx(self._rope_section, self._rope_theta, deltas.astype(jnp.int32), dtype=self._dtype)
         steps = max_new_tokens - 1
         decode_tokens, decode_logprobs = self.decode_loop(
             cache,
@@ -314,7 +338,7 @@ class Sampler:
             top_p=top_p,
             top_k=top_k,
             eos_id=eos_id,
-            rope_ctx=rope_ctx,
+            rope_deltas=rope_deltas,
             rng=rng,
             return_logprobs=return_logprobs,
         )

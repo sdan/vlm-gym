@@ -203,7 +203,14 @@ def main(_):
                 attention_mask=attn_mask,
                 tokens_per_second=float(model.spec.vision.tokens_per_second),
             )
-            cos, sin = build_mrope(pos3, tuple(model.spec.text.rope_section), float(model.spec.text.rope_theta), dtype=model.dtype)
+            cos, sin = build_mrope(
+                pos3,
+                tuple(model.spec.text.rope_section),
+                float(model.spec.text.rope_theta),
+                dtype=model.dtype,
+                rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
+                rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
+            )
             # Forward with vision injection
             logits, _ = state.call_model(text_input, vision_embeds, image_pad_id, cos, sin, mask=attn_mask, cache=None, method=model.forward_vlm)
             logprobs = jax.nn.log_softmax(logits, axis=-1)
@@ -641,7 +648,14 @@ def main(_):
                     attention_mask=token_mask,
                     tokens_per_second=float(model.spec.vision.tokens_per_second),
                 )
-                cos, sin = build_mrope(pos3, tuple(model.spec.text.rope_section), float(model.spec.text.rope_theta), dtype=model.dtype)
+                cos, sin = build_mrope(
+                    pos3,
+                    tuple(model.spec.text.rope_section),
+                    float(model.spec.text.rope_theta),
+                    dtype=model.dtype,
+                    rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
+                    rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
+                )
                 logits, _ = state.call_model(text_input, vision_embeds_mb, image_pad_id, cos, sin, mask=token_mask, cache=None, params=grad_params, method=model.forward_vlm)
                 all_logprobs = jax.nn.log_softmax(logits)
                 token_logprobs = jnp.sum(all_logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)

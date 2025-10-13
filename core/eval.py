@@ -211,7 +211,20 @@ def eval_model(
                 # Non-numeric (e.g., response text). Extend local list without device collect.
                 env_infos_history[k] += list(v)
         env_infos_history['return'] += returns.tolist()
-    env_infos_history = {k: np.array(v)[:total_num_tasks] for k, v in env_infos_history.items()}
+    def _safe_numpy(x_list):
+        try:
+            arr = np.array(x_list)
+        except Exception:
+            return x_list  # keep as list when ragged or non-uniform
+        # Keep lists for ragged object arrays
+        if arr.dtype == object:
+            # Attempt to squeeze only scalar-like entries; otherwise, keep as list
+            if all(np.ndim(x) == 0 for x in x_list):
+                return arr[:total_num_tasks]
+            return x_list
+        return arr[:total_num_tasks]
+
+    env_infos_history = {k: _safe_numpy(v) for k, v in env_infos_history.items()}
     return new_states, env_infos_history
 
 

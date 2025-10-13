@@ -42,6 +42,7 @@ def apply_multimodal_rotary_pos_emb(
     k: jax.Array,
     cos: jax.Array,
     sin: jax.Array,
+    rope_section: Sequence[int],
     unsqueeze_dim: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Apply rotary position embeddings to q and k.
@@ -49,12 +50,39 @@ def apply_multimodal_rotary_pos_emb(
     Expects pre-built cos/sin tensors matching the head_dim layout (either via
     ``build_text_rope`` for 1D text or ``build_mrope`` for multimodal tokens).
     """
-    # tiny broadcast trick for heads
+    sections = tuple(int(x) for x in rope_section)
+    if len(sections) == 0:
+        raise ValueError("rope_section must be non-empty")
+    total_dim = sum(sections)
+    if cos.shape[-1] != total_dim * 2 or sin.shape[-1] != total_dim * 2:
+        raise ValueError(
+            f"Expected cos/sin last dim {total_dim * 2}, got cos={cos.shape[-1]}, sin={sin.shape[-1]}"
+        )
+    num_axes = cos.shape[0]
+    if num_axes != len(sections):
+        raise ValueError(
+            f"rope_section length ({len(sections)}) must match cos/sin first dimension ({num_axes})"
+        )
 
-    cos = jnp.expand_dims(cos, axis=unsqueeze_dim).astype(q.dtype)
-    sin = jnp.expand_dims(sin, axis=unsqueeze_dim).astype(q.dtype)
-    q_embed = q * cos + rotate_half(q) * sin
-    k_embed = k * cos + rotate_half(k) * sin
+    def _reorder(table: jax.Array) -> jax.Array:
+        idx = 0
+        chunks: list[jax.Array] = []
+        for _ in range(2):
+            for sec in sections:
+                next_idx = idx + sec
+                chunks.append(table[..., idx:next_idx])
+                idx = next_idx
+        if not chunks:
+            raise ValueError("Failed to split rotary tables; rope_section may be invalid.")
+        gathered = [chunk[i % num_axes] for i, chunk in enumerate(chunks)]
+        return jnp.concatenate(gathered, axis=-1)
+
+    cos_flat = _reorder(cos).astype(q.dtype)
+    sin_flat = _reorder(sin).astype(q.dtype)
+    cos_embed = jnp.expand_dims(cos_flat, axis=unsqueeze_dim)
+    sin_embed = jnp.expand_dims(sin_flat, axis=unsqueeze_dim)
+    q_embed = q * cos_embed + rotate_half(q) * sin_embed
+    k_embed = k * cos_embed + rotate_half(k) * sin_embed
     return q_embed, k_embed
 
 
@@ -63,73 +91,68 @@ def build_text_rope(
     rope_section: Sequence[int],
     rope_theta: float,
     dtype: DType = jnp.bfloat16,
+    *,
+    rope_scaling_type: Optional[str] = None,
+    rope_scaling_factor: Optional[float] = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute text RoPE sin/cos tensors for 1D positions.
 
     # classic rope for tokens
     """
-
-    positions = positions.astype(jnp.float32)
-    total_dim = sum(rope_section)
-    inv_freq = 1.0 / (rope_theta ** (jnp.arange(0, total_dim, dtype=jnp.float32) / total_dim))
-    freqs = jnp.einsum("bs,k->bsk", positions, inv_freq, precision=jax.lax.Precision.HIGHEST)
-    emb = jnp.concatenate([freqs, freqs], axis=-1)
-    cos_full = jnp.cos(emb)
-    sin_full = jnp.sin(emb)
-
-    cos_parts: list[jax.Array] = []
-    sin_parts: list[jax.Array] = []
-    start_idx = 0
-    for section in rope_section:
-        section_doubled = section * 2
-        cos_parts.append(cos_full[..., start_idx : start_idx + section_doubled])
-        sin_parts.append(sin_full[..., start_idx : start_idx + section_doubled])
-        start_idx += section_doubled
-
-    cos = jnp.concatenate(cos_parts, axis=-1).astype(dtype)
-    sin = jnp.concatenate(sin_parts, axis=-1).astype(dtype)
-    return cos, sin
+    axes = len(tuple(int(x) for x in rope_section))
+    if axes <= 0:
+        raise ValueError("rope_section must contain at least one entry")
+    pos_axes = jnp.broadcast_to(positions[None, ...], (axes,) + positions.shape)
+    return build_mrope(
+        pos_axes,
+        rope_section,
+        rope_theta,
+        dtype=dtype,
+        rope_scaling_type=rope_scaling_type,
+        rope_scaling_factor=rope_scaling_factor,
+    )
 
 
 def build_mrope(
-    position_ids_3: jax.Array,
+    position_ids_axes: jax.Array,
     rope_section: Sequence[int],
     rope_theta: float,
     dtype: DType = jnp.bfloat16,
+    *,
+    rope_scaling_type: Optional[str] = None,
+    rope_scaling_factor: Optional[float] = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute multimodal RoPE sin/cos tensors for 3D indices.
 
     # separate axes then concat parts
     """
 
-    if position_ids_3.ndim != 3 or position_ids_3.shape[0] != 3:
-        raise ValueError("position_ids_3 must have shape (3, batch, seq_len)")
-    if len(rope_section) != 3:
-        raise ValueError("rope_section must contain 3 entries for (t, h, w)")
-
-    total_dim = sum(rope_section)
-    cos_parts: list[jax.Array] = []
-    sin_parts: list[jax.Array] = []
-
-    offsets = [0, int(rope_section[0]), int(rope_section[0] + rope_section[1])]
-    for axis in range(3):
-        sec = int(rope_section[axis])
-        if sec <= 0:
-            raise ValueError("Each rope_section entry must be positive")
-        start = int(offsets[axis])
-        inv_freq_axis = 1.0 / (
-            rope_theta ** (jnp.arange(start, start + sec, dtype=jnp.float32) / float(total_dim))
+    if position_ids_axes.ndim != 3:
+        raise ValueError("position_ids_axes must have shape (num_axes, batch, seq_len)")
+    sections = tuple(int(x) for x in rope_section)
+    num_axes = position_ids_axes.shape[0]
+    if len(sections) != num_axes:
+        raise ValueError(
+            f"rope_section length ({len(sections)}) must equal number of axes ({num_axes})"
         )
-        pos_axis = position_ids_3[axis].astype(jnp.float32)
-        freqs_axis = jnp.einsum(
-            "bs,k->bsk", pos_axis, inv_freq_axis, precision=jax.lax.Precision.HIGHEST
-        )
-        emb_axis = jnp.concatenate([freqs_axis, freqs_axis], axis=-1)
-        cos_parts.append(jnp.cos(emb_axis))
-        sin_parts.append(jnp.sin(emb_axis))
+    if any(sec <= 0 for sec in sections):
+        raise ValueError("All rope_section entries must be positive")
 
-    cos = jnp.concatenate(cos_parts, axis=-1).astype(dtype)
-    sin = jnp.concatenate(sin_parts, axis=-1).astype(dtype)
+    pos = position_ids_axes.astype(jnp.float32)
+    if rope_scaling_factor is not None and rope_scaling_type in (None, "linear", "dynamic", "finetuned"):
+        try:
+            scale = float(rope_scaling_factor)
+        except Exception:
+            scale = 1.0
+        if scale > 0.0:
+            pos = pos / jnp.float32(scale)
+
+    total_dim = sum(sections)
+    inv_freq = 1.0 / (rope_theta ** (jnp.arange(0, total_dim, dtype=jnp.float32) / float(total_dim)))
+    freqs = jnp.einsum("sbn,k->sbnk", pos, inv_freq, precision=jax.lax.Precision.HIGHEST)
+    emb = jnp.concatenate([freqs, freqs], axis=-1)
+    cos = jnp.cos(emb).astype(dtype)
+    sin = jnp.sin(emb).astype(dtype)
     return cos, sin
 
 
@@ -300,12 +323,30 @@ def _build_rope_from_positions(
     rope_theta: float,
     dtype: DType,
     deltas: Optional[jax.Array] = None,
+    *,
+    rope_scaling_type: Optional[str] = None,
+    rope_scaling_factor: Optional[float] = None,
 ) -> tuple[jax.Array, jax.Array]:
     if deltas is None:
-        return build_text_rope(positions, rope_section, rope_theta, dtype=dtype)
+        return build_text_rope(
+            positions,
+            rope_section,
+            rope_theta,
+            dtype=dtype,
+            rope_scaling_type=rope_scaling_type,
+            rope_scaling_factor=rope_scaling_factor,
+        )
     shifted = positions + deltas
-    pos3 = jnp.tile(shifted[None, :, :], (3, 1, 1))
-    return build_mrope(pos3, rope_section, rope_theta, dtype=dtype)
+    axes = len(rope_section)
+    pos3 = jnp.broadcast_to(shifted[None, :, :], (axes, shifted.shape[0], shifted.shape[1]))
+    return build_mrope(
+        pos3,
+        rope_section,
+        rope_theta,
+        dtype=dtype,
+        rope_scaling_type=rope_scaling_type,
+        rope_scaling_factor=rope_scaling_factor,
+    )
 
 
 @dataclass
@@ -318,6 +359,8 @@ class TextBackboneSpec:
     intermediate_size: int
     rope_theta: float
     rope_section: Sequence[int]
+    rope_scaling_type: Optional[str]
+    rope_scaling_factor: Optional[float]
     rms_norm_eps: float
     vocab_size: int
 
@@ -416,7 +459,7 @@ class MultiHeadAttention(nn.Module):
         k = jnp.transpose(k, (0, 2, 1, 3))
         v = jnp.transpose(v, (0, 2, 1, 3))
 
-        q, k = apply_multimodal_rotary_pos_emb(q, k, cos, sin)  # rope here
+        q, k = apply_multimodal_rotary_pos_emb(q, k, cos, sin, self.rope_section)  # rope here
 
         if mask is not None:
             if jnp.issubdtype(mask.dtype, jnp.floating):
@@ -444,16 +487,27 @@ class MultiHeadAttention(nn.Module):
         history_mask = (
             (jnp.arange(k.shape[2])[None, :] < effective_lengths[:, None]).astype(jnp.float32)
         )
+        # Grouped-query attention without explicit repeat
         if self.num_heads != self.num_kv_heads:
+            # Reshape for grouped attention: group queries with their kv heads
             repeats = self.num_heads // self.num_kv_heads
-            k = jnp.repeat(k, repeats, axis=1)
-            v = jnp.repeat(v, repeats, axis=1)
-
-        attn_scores = jnp.einsum(
-            "bhqd,bhkd->bhqk",
-            q.astype(jnp.float32),
-            k.astype(jnp.float32),
-        ) * (self.head_dim ** -0.5)
+            q_grouped = q.reshape(batch, self.num_kv_heads, repeats, q.shape[2], self.head_dim)
+            # k stays as (batch, kv_heads, k_len, dim) - no need to expand yet
+            
+            # Compute attention scores with einsum that handles the broadcasting
+            attn_scores = jnp.einsum(
+                "bhgqd,bhkd->bhgqk",
+                q_grouped.astype(jnp.float32),
+                k.astype(jnp.float32),
+            ) * (self.head_dim ** -0.5)
+            # Reshape back to (batch, num_heads, q_len, k_len)
+            attn_scores = attn_scores.reshape(batch, self.num_heads, q.shape[2], k.shape[2])
+        else:
+            attn_scores = jnp.einsum(
+                "bhqd,bhkd->bhqk",
+                q.astype(jnp.float32),
+                k.astype(jnp.float32),
+            ) * (self.head_dim ** -0.5)
         attn_scores = attn_scores + (1.0 - history_mask)[:, None, None, :].astype(jnp.float32) * -1e9  # mask pad
         q_len = attn_scores.shape[2]
         if q_len > 1:
@@ -461,11 +515,26 @@ class MultiHeadAttention(nn.Module):
             causal = jnp.tril(jnp.ones((q_len, k_len), dtype=jnp.float32))  # causal triangle
             attn_scores = attn_scores + (1.0 - causal)[None, None, :, :] * -1e9
         attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-        attn_output = jnp.einsum(
-            "bhqk,bhkd->bhqd",
-            attn_weights,
-            v.astype(jnp.float32),
-        ).astype(self.dtype)
+        
+        # Apply attention weights with grouped-query pattern if needed
+        if self.num_heads != self.num_kv_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            # Reshape weights for grouped computation
+            attn_weights_grouped = attn_weights.reshape(batch, self.num_kv_heads, repeats, q_len, -1)
+            # Compute output with einsum that handles the broadcasting
+            attn_output = jnp.einsum(
+                "bhgqk,bhkd->bhgqd",
+                attn_weights_grouped,
+                v.astype(jnp.float32),
+            )
+            # Reshape back to (batch, num_heads, q_len, head_dim)
+            attn_output = attn_output.reshape(batch, self.num_heads, q_len, self.head_dim).astype(self.dtype)
+        else:
+            attn_output = jnp.einsum(
+                "bhqk,bhkd->bhqd",
+                attn_weights,
+                v.astype(jnp.float32),
+            ).astype(self.dtype)
         attn_output = jnp.transpose(attn_output, (0, 2, 1, 3)).reshape(batch, seqlen, -1)
         out = nn.Dense(self.hidden_size, use_bias=False, dtype=self.dtype, name="o_proj")(
             attn_output
@@ -581,40 +650,6 @@ class KVCache(flax.struct.PyTreeNode):
         return new_layer_keys, new_layer_values, cache
 
 
-@flax.struct.dataclass
-class TextRopeCtx:
-    # Treat constants as static (non-pytree) to avoid JAX tracing them.
-    rope_section: tuple[int, ...] = flax.struct.field(pytree_node=False)
-    rope_theta: float = flax.struct.field(pytree_node=False)
-    dtype: DType = flax.struct.field(default=jnp.bfloat16, pytree_node=False)
-
-    def build(self, positions: jax.Array) -> tuple[jax.Array, jax.Array]:
-        return _build_rope_from_positions(
-            positions,
-            self.rope_section,
-            self.rope_theta,
-            self.dtype,
-        )
-
-
-@flax.struct.dataclass
-class MRopeCtx:
-    # Keep dynamic arrays as pytree (deltas), but mark constants static.
-    rope_section: tuple[int, ...] = flax.struct.field(pytree_node=False)
-    rope_theta: float = flax.struct.field(pytree_node=False)
-    deltas: jax.Array = flax.struct.field(pytree_node=True)
-    dtype: DType = flax.struct.field(default=jnp.bfloat16, pytree_node=False)
-
-    def build(self, positions: jax.Array) -> tuple[jax.Array, jax.Array]:
-        return _build_rope_from_positions(
-            positions,
-            self.rope_section,
-            self.rope_theta,
-            self.dtype,
-            deltas=self.deltas,
-        )
-
-
 class Qwen25VLModel(nn.Module):
     spec: Qwen25VLSpec
     dtype: DType = jnp.bfloat16
@@ -667,8 +702,8 @@ class Qwen25VLModel(nn.Module):
                 update_lengths=bool(cache is not None and layer_id == last_layer_idx),  # bump cache len at last layer
             )
         hidden = self.final_norm(hidden)
-        logits = self.lm_head(hidden.astype(jnp.float32))
-        return logits.astype(self.dtype), new_cache
+        logits = self.lm_head(hidden.astype(jnp.float32))  # keep logits in fp32
+        return logits, new_cache
 
     def forward_text(
         self,
@@ -727,13 +762,30 @@ class Qwen25VLModel(nn.Module):
         self,
         token: jax.Array,
         cache: KVCache,
-        rope_ctx: Union[TextRopeCtx, MRopeCtx],
+        rope_deltas: Optional[jax.Array],
         mask: Optional[jax.Array] = None,
     ) -> tuple[jax.Array, KVCache]:
         if token.ndim != 1:
             raise ValueError("token must have shape (batch,)")
         positions = cache.lengths[:, None]  # next token positions
-        cos, sin = rope_ctx.build(positions)
+        batch = positions.shape[0]
+        axes = len(tuple(int(x) for x in self.spec.text.rope_section))
+        if axes <= 0:
+            raise ValueError("Model spec must define a non-empty rope_section")
+        base_positions = jnp.broadcast_to(positions[None, :, :], (axes, batch, positions.shape[1]))
+        if rope_deltas is not None:
+            rope_offsets = rope_deltas.astype(jnp.int32)[None, :, :]
+        else:
+            rope_offsets = jnp.zeros((axes, batch, 1), dtype=jnp.int32)
+        position_ids_axes = base_positions + rope_offsets
+        cos, sin = build_mrope(
+            position_ids_axes,
+            tuple(self.spec.text.rope_section),
+            self.spec.text.rope_theta,
+            dtype=self.dtype,
+            rope_scaling_type=self.spec.text.rope_scaling_type,
+            rope_scaling_factor=self.spec.text.rope_scaling_factor,
+        )
         step_tokens = token[:, None]
         if mask is None:
             mask = jnp.ones((step_tokens.shape[0], 1), dtype=jnp.int32)
@@ -760,21 +812,53 @@ def spec_from_config(cfg: dict[str, Any]) -> Qwen25VLSpec:
     # Map HF config to our internal spec
     text_cfg = cfg.get("text_config", cfg)
     rope_cfg = text_cfg.get("rope_scaling", cfg.get("rope_scaling", {}))
+    # Compute common head_dim once; needed for RoPE section validation
+    _head_dim = text_cfg["hidden_size"] // text_cfg["num_attention_heads"]
+    vision_cfg = cfg.get("vision_config")
+
+    # Parse optional rope scaling type/factor
+    rope_scaling_type = None
+    rope_scaling_factor = None
+    if isinstance(rope_cfg, dict):
+        rope_scaling_type = rope_cfg.get("type")
+        rope_scaling_factor = rope_cfg.get("factor", rope_cfg.get("finetuned_factor"))
+
+    # Validate/derive rope_section
+    raw_section = (rope_cfg.get("mrope_section", None) if isinstance(rope_cfg, dict) else None)
+    rope_section: list[int]
+    if raw_section is None:
+        # If a vision tower is configured, mRoPE sections are checkpoint-dependent.
+        # Fail loudly rather than guessing a split that could corrupt angles.
+        if vision_cfg is not None:
+            raise ValueError(
+                "Missing rope_scaling.mrope_section for vision model; expected 3-tuple summing to head_dim//2."
+            )
+        # Text-only: fallback to classic RoPE with half-dim
+        rope_section = [_head_dim // 2]
+    else:
+        # Normalize and validate
+        rope_section = [int(x) for x in raw_section]
+        if vision_cfg is not None and len(rope_section) != 3:
+            raise ValueError("rope_scaling.mrope_section must have 3 entries (t,h,w) for vision models")
+        expected = _head_dim // 2
+        if sum(rope_section) != expected:
+            raise ValueError(
+                f"Sum of rope_scaling.mrope_section must equal head_dim//2 ({expected}); got {sum(rope_section)}"
+            )
     text = TextBackboneSpec(
         hidden_size=text_cfg["hidden_size"],
         num_attention_heads=text_cfg["num_attention_heads"],
         num_hidden_layers=text_cfg["num_hidden_layers"],
         num_key_value_heads=text_cfg["num_key_value_heads"],
-        head_dim=text_cfg["hidden_size"] // text_cfg["num_attention_heads"],
+        head_dim=_head_dim,
         intermediate_size=text_cfg["intermediate_size"],
         rope_theta=text_cfg.get("rope_theta", cfg.get("rope_theta", 10000.0)),
-        rope_section=rope_cfg.get(
-            "mrope_section", [text_cfg["hidden_size"] // text_cfg["num_attention_heads"]]
-        ),  # fallback: 1D rope section
+        rope_section=rope_section,
+        rope_scaling_type=rope_scaling_type,
+        rope_scaling_factor=(float(rope_scaling_factor) if rope_scaling_factor is not None else None),
         rms_norm_eps=text_cfg["rms_norm_eps"],
         vocab_size=text_cfg["vocab_size"],
     )
-    vision_cfg = cfg.get("vision_config")
     vision = None
     if vision_cfg is not None:
         vision = VisionBackboneSpec(
@@ -901,8 +985,9 @@ def create_model_from_hf(hf_dir: str) -> tuple[Qwen25VLModel, dict[str, Any]]:
     model = Qwen25VLModel(spec)
 
     dummy_ids = jnp.zeros((1, 1), dtype=jnp.int32)
-    dummy_cos = jnp.zeros((1, 1, spec.text.head_dim))
-    dummy_sin = jnp.zeros((1, 1, spec.text.head_dim))
+    rope_axes = len(tuple(int(x) for x in spec.text.rope_section))
+    dummy_cos = jnp.zeros((rope_axes, 1, 1, spec.text.head_dim), dtype=model.dtype)
+    dummy_sin = jnp.zeros((rope_axes, 1, 1, spec.text.head_dim), dtype=model.dtype)
     text_vars = model.init(jax.random.PRNGKey(0), dummy_ids, dummy_cos, dummy_sin)
     param_dict = flax.core.unfreeze(text_vars["params"])
 
@@ -979,8 +1064,6 @@ def create_model_from_ckpt(ckpt_dir: str) -> tuple[Qwen25VLModel, dict[str, Any]
 __all__ = [
     "Qwen25VLModel",
     "KVCache",
-    "TextRopeCtx",
-    "MRopeCtx",
     "apply_multimodal_rotary_pos_emb",
     "build_text_rope",
     "build_mrope",

@@ -5,9 +5,7 @@
 
 from .model import (
     KVCache,
-    MRopeCtx,
     Qwen25VLModel,
-    TextRopeCtx,
     apply_multimodal_rotary_pos_emb,
     build_mrope,
     build_text_rope,
@@ -22,8 +20,6 @@ __all__ = [
     "Qwen25VLModel",
     "Qwen25VisionTransformer",
     "KVCache",
-    "TextRopeCtx",
-    "MRopeCtx",
     "apply_multimodal_rotary_pos_emb",
     "build_text_rope",
     "build_mrope",
