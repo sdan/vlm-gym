@@ -1,8 +1,6 @@
-<img width="1027" height="566" alt="Screenshot 2025-10-09 at 12 10 39 PM" src="https://github.com/user-attachments/assets/43d593ed-3426-4532-8462-f3108dcf4f33" />
-
 # vlm-gym
 
-A modular reinforcement learning framework for vision-language models, written in JAX. Drop in any environment, any model, and train with GRPO.
+A simple reinforcement learning framework for vision-language models, written in JAX. Drop in any environment, any model, and train with GRPO.
 
 **Core components:**
 - `envs/` — Pluggable vision environments (GeoGuessr, NLVR2, captioning)
