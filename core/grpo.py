@@ -1,15 +1,21 @@
+"""
+Minimal on-policy GRPO loop for Qwen2.5-VL vision-language training.
+
+The goal is to keep the reinforcement-learning core easy to follow: collect
+rollouts, compute a mean-baseline advantage, and apply REINFORCE with optional
+entropy regularization. Vision-specific plumbing (encoding images, building
+mixed RoPE, etc.) is preserved so this works with existing VLM environments.
+"""
+
+from __future__ import annotations
+
 import sys
-import time
-import os
-import json
-from pathlib import Path
-from functools import partial
+from typing import Dict, List, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import tqdm
 import wandb
 import ml_collections
 from absl import app, flags
@@ -38,119 +44,325 @@ from vlmrl.utils.vlm import (
 )
 
 
-# Default config focused on VLM training
 config = ml_collections.ConfigDict({
-    'wandb_project': "lmpo",
-    'wandb_name': 'grpo-vlm',
-    'wandb_group': 'Default',
-    'model_dir': 'checkpoints/qwen25vl_window',
-    'save_dir': "",
-    'save_interval': 50,
-    # env settings
-    'env_name': 'vision',
-    'total_steps': 10000,     # number of training steps
-    'num_generation_tokens': 64,  # set explicitly for VLM
-    # sampling settings
-    'inference_batch_per_device': 1,  # keep very small to avoid OOM
-    # PPO/GRPO settings
-    'groups_per_batch': 8,    # reduce to curb memory
-    'group_size': 1,          # ensure rollout_batch_size % group_size == 0 on 1 GPU
-    'ppo_minibatch': 2,       # smaller minibatch to reduce logits memory
-    'lr': 5e-7,
-    'clip_epsilon': 0.2,
-    'entropy_coef': 0.001,
-    'weight_decay': 1e-2,
-    # sharding / optimizer
-    'shard': 'dp',            # 'dp' (replicate) or 'fsdp' (shard params)
-    'optimizer': 'adafactor', # 'adafactor' (low-memory) or 'adamw'
-    # advantage shaping
-    'do_group_normalization': 1,
-    'do_global_normalization': 0,
-    'do_group_filter': 1,
-    'do_clip_advantages': 0,
-    # importance sampling choices
-    'do_inference_logprobs': 1,
-    'do_mask_importance_ratio': 0,
-    'do_ppo_all_clip': 0,
-    # image preprocessing bounds
-    'vlm_min_pixels': -1,
-    'vlm_max_pixels': -1,
-    # decoding controls
-    'top_k': -1,
-    'top_p': -1.0,
-    'temperature': 1.0,
-    # optional test pass
-    'test_env_name': '',
-    'test_interval': 25,
-    # debug options
-    'debug_print_samples': 0,
-    'debug_samples_n': 2,
-    'debug_log_wandb_samples': 0,
+    "wandb_project": "lmpo",
+    "wandb_name": "grpo-simple",
+    "wandb_group": "Default",
+    "model_dir": "checkpoints/qwen25vl_window",
+    "save_dir": "",
+    "save_interval": 200,
+    "env_name": "vision",
+    "total_steps": 1000,
+    "num_generation_tokens": 64,
+    "inference_batch_per_device": 1,
+    "groups_per_batch": 8,
+    "lr": 5e-7,
+    "entropy_coef": 0.0,
+    "kl_coef": 0.0,
+    "weight_decay": 1e-2,
+    "optimizer": "adafactor",
+    "vlm_min_pixels": -1,
+    "vlm_max_pixels": -1,
+    "temperature": 0.7,
+    "top_k": 1024,
+    "top_p": 0.9,
+    "test_env_name": "",
+    "test_interval": 200,
 })
 define_flag_dict(config)
 FLAGS = flags.FLAGS
 
 
-def _pad_right(arrs, pad_val, axis=1):
-    """Right-pad variable-length sequences to a common length along `axis`.
-
-    Accepts a list of 1D or 2D arrays (or jnp arrays). Returns a stacked jnp array.
-    More robust to scalars and 1D inputs by expanding dims as needed.
-    """
-    if not arrs:
-        # Return a minimal empty tensor; caller typically reshapes after
+def _pad_sequences(seqs: List[np.ndarray], pad_val: int) -> jnp.ndarray:
+    if not seqs:
         return jnp.zeros((0, 0), dtype=jnp.int32)
-
-    prepped = []
-    for idx, a in enumerate(arrs):
-        try:
-            arr = jnp.asarray(a)
-        except Exception as e:
-            raise TypeError(f"_pad_right: failed to convert item {idx} of type {type(a)} to array") from e
-
-        # Ensure the pad axis exists by expanding dims at the axis position.
-        while arr.ndim <= int(axis):
-            arr = jnp.expand_dims(arr, axis=axis)
-
-        prepped.append(arr)
-
-    # Compute target length along the pad axis
-    try:
-        max_len = int(max(a.shape[axis] for a in prepped))
-    except IndexError as e:
-        shapes = [tuple(a.shape) for a in prepped]
-        raise IndexError(f"_pad_right: axis {axis} out of range for shapes {shapes}") from e
-
-    padded = []
-    for arr in prepped:
-        # Verify other dims match so stacking is possible
-        other_shape = arr.shape[:axis] + arr.shape[axis + 1 :]
-        # Build pad spec: only pad the target axis to max_len
-        pad_amt = max_len - int(arr.shape[axis])
-        if pad_amt < 0:
-            raise ValueError("_pad_right received an array longer than max_len")
-        pad_spec = [(0, 0)] * arr.ndim
-        pad_spec[axis] = (0, pad_amt)
-        padded.append(jnp.pad(arr, pad_spec, constant_values=pad_val))
-
-    # Stack along a new leading batch axis
-    try:
-        return jnp.stack(padded, axis=0)
-    except Exception as e:
-        shapes = [tuple(a.shape) for a in padded]
-        raise ValueError(f"_pad_right: cannot stack arrays with shapes {shapes} (axis={axis})") from e
+    max_len = max(int(seq.shape[0]) for seq in seqs)
+    out = np.full((len(seqs), max_len), pad_val, dtype=np.int32)
+    for i, seq in enumerate(seqs):
+        arr = np.asarray(seq, dtype=np.int32)
+        out[i, :arr.shape[0]] = arr
+    return jnp.asarray(out)
 
 
-def _maybe_limit(val, default):
-    try:
-        v = int(val)
-        return None if v <= 0 else v
-    except Exception:
-        return default
+def _pad_float_sequences(seqs: List[np.ndarray], pad_val: float = 0.0) -> jnp.ndarray:
+    if not seqs:
+        return jnp.zeros((0, 0), dtype=jnp.float32)
+    max_len = max(int(seq.shape[0]) for seq in seqs)
+    out = np.full((len(seqs), max_len), pad_val, dtype=np.float32)
+    for i, seq in enumerate(seqs):
+        arr = np.asarray(seq, dtype=np.float32)
+        out[i, :arr.shape[0]] = arr
+    return jnp.asarray(out)
+
+
+def _pad_vision(arrs: List[np.ndarray]) -> jnp.ndarray:
+    if not arrs:
+        return jnp.zeros((0, 0, 0), dtype=jnp.float32)
+    dim = int(arrs[0].shape[-1])
+    max_tokens = max(int(arr.shape[0]) for arr in arrs)
+    out = np.zeros((len(arrs), max_tokens, dim), dtype=np.float32)
+    for i, arr in enumerate(arrs):
+        out[i, :arr.shape[0], :] = np.asarray(arr, dtype=np.float32)
+    return jnp.asarray(out)
+
+
+def _pad_grid(arrs: List[np.ndarray]) -> jnp.ndarray:
+    if not arrs:
+        return jnp.zeros((0, 0, 3), dtype=jnp.int32)
+    max_rows = max(int(arr.shape[0]) for arr in arrs)
+    out = np.zeros((len(arrs), max_rows, 3), dtype=np.int32)
+    for i, arr in enumerate(arrs):
+        np_arr = np.asarray(arr, dtype=np.int32)
+        out[i, :np_arr.shape[0], :] = np_arr
+    return jnp.asarray(out)
+
+
+def _prepare_prompt_and_embeds(
+    model: Qwen25VLModel,
+    train_state: TrainState,
+    tokenizer,
+    obs,
+    vlm_min_pixels: int | None,
+    vlm_max_pixels: int | None,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    vision_spec = model.spec.vision
+    if vision_spec is None:
+        raise ValueError("Model must include a vision backbone")
+
+    def _pixels(val):
+        if val and val > 0:
+            return val
+        return None
+
+    min_pixels = _pixels(vlm_min_pixels) or DEFAULT_MIN_PIXELS
+    max_pixels = _pixels(vlm_max_pixels) or DEFAULT_MAX_PIXELS
+
+    if hasattr(obs, "image_path") and hasattr(obs, "question"):
+        pix, grid = preprocess_image(
+            obs.image_path,
+            patch_size=vision_spec.patch_size,
+            spatial_merge_size=vision_spec.spatial_merge_size,
+            temporal_patch_size=vision_spec.temporal_patch_size,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+        embeds = model.apply(
+            {"params": train_state.params},
+            pix,
+            grid,
+            method=model.encode_vision,
+        )
+        num_tokens = int(embeds.shape[0])
+        prompt_text = chat_prompt_with_image(num_tokens, getattr(obs, "question", ""))
+        input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_tokens = jnp.asarray([input_ids], dtype=jnp.int32)
+        return prompt_tokens, embeds, grid
+
+    if (
+        hasattr(obs, "image_left")
+        and hasattr(obs, "image_right")
+        and hasattr(obs, "statement")
+    ):
+        pix_l, grid_l = preprocess_image(
+            obs.image_left,
+            patch_size=vision_spec.patch_size,
+            spatial_merge_size=vision_spec.spatial_merge_size,
+            temporal_patch_size=vision_spec.temporal_patch_size,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+        pix_r, grid_r = preprocess_image(
+            obs.image_right,
+            patch_size=vision_spec.patch_size,
+            spatial_merge_size=vision_spec.spatial_merge_size,
+            temporal_patch_size=vision_spec.temporal_patch_size,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+        emb_l = model.apply(
+            {"params": train_state.params},
+            pix_l,
+            grid_l,
+            method=model.encode_vision,
+        )
+        emb_r = model.apply(
+            {"params": train_state.params},
+            pix_r,
+            grid_r,
+            method=model.encode_vision,
+        )
+        embeds = jnp.concatenate([emb_l, emb_r], axis=0)
+        grid = jnp.concatenate([grid_l, grid_r], axis=0)
+        prompt_text = chat_prompt_with_images(
+            [int(emb_l.shape[0]), int(emb_r.shape[0])],
+            f"Look at the two images. {getattr(obs, 'statement', '')}",
+        )
+        input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_tokens = jnp.asarray([input_ids], dtype=jnp.int32)
+        return prompt_tokens, embeds, grid
+
+    raise ValueError("Unsupported observation structure for vision RL")
+
+
+def _build_masks(prompt_lens: np.ndarray, action_lens: np.ndarray, seq_len: int) -> jnp.ndarray:
+    mask = np.zeros((len(prompt_lens), seq_len), dtype=np.int32)
+    for i, (prompt_len, action_len) in enumerate(zip(prompt_lens, action_lens, strict=True)):
+        start = max(int(prompt_len) - 1, 0)
+        end = min(start + max(int(action_len) - 1, 0), seq_len - 1)
+        if end >= start:
+            mask[i, start : end + 1] = 1
+    return jnp.asarray(mask)
+
+
+def collect_rollouts(
+    train_state: TrainState,
+    sampler: VLMSampler,
+    env,
+    tokenizer,
+    model: Qwen25VLModel,
+    pad_id: int,
+    image_pad_id: int,
+    rng: jax.random.PRNGKey,
+    shard_data_fn,
+    rollout_batch_size: int,
+    groups_per_batch: int,
+    env_task_idx: int,
+    vlm_min_pixels: int | None,
+    vlm_max_pixels: int | None,
+    eos_id: int | None,
+    temperature: float,
+    top_k: int | None,
+    top_p: float | None,
+) -> Tuple[jax.random.PRNGKey, int, Dict[str, jnp.ndarray], Dict[str, float]]:
+    buffer_tokens: List[jnp.ndarray] = []
+    buffer_logprobs: List[jnp.ndarray] = []
+    buffer_rewards: List[float] = []
+    buffer_prompt_lens: List[int] = []
+    buffer_action_lens: List[int] = []
+    buffer_vis_embeds: List[jnp.ndarray] = []
+    buffer_grid: List[jnp.ndarray] = []
+    buffer_texts: List[str] = []
+
+    env_num_tasks = env.num_tasks if env.num_tasks != -1 else 1_000_000
+    stats = {"rollouts": 0.0, "reward_mean": 0.0}
+
+    while len(buffer_tokens) < groups_per_batch:
+        states = []
+        observations = []
+        for _ in range(rollout_batch_size):
+            idx = min(env_task_idx + jax.process_index(), env_num_tasks - 1)
+            env_state, obs = env.reset(idx)
+            env_task_idx = (env_task_idx + jax.process_count()) % env_num_tasks
+            states.append(env_state)
+            observations.append(obs)
+
+        actions = []
+        tokens_local = []
+        logprobs_local = []
+        prompt_lens_local = []
+        action_lens_local = []
+        embeds_local = []
+        grid_local = []
+        responses_local = []
+
+        for obs in observations:
+            prompt_tokens, embeds, grid = _prepare_prompt_and_embeds(
+                model,
+                train_state,
+                tokenizer,
+                obs,
+                vlm_min_pixels,
+                vlm_max_pixels,
+            )
+            prompt_len = int(prompt_tokens.shape[1])
+            rng, key = jax.random.split(rng)
+            generated, sample_logprobs = sampler.sample_vlm(
+                prompt_tokens,
+                embeds,
+                grid,
+                image_pad_id=image_pad_id,
+                max_new_tokens=int(FLAGS.num_generation_tokens),
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                eos_id=eos_id,
+                pad_id=pad_id,
+                rng=key,
+                return_logprobs=True,
+            )
+            gen_tokens = generated[0]
+            full_tokens = jnp.concatenate([prompt_tokens[0], gen_tokens], axis=0)
+            zeros = jnp.zeros((prompt_len,), dtype=jnp.float32)
+            full_logprobs = jnp.concatenate([zeros, sample_logprobs[0]], axis=0)
+
+            actions.append(gen_tokens.tolist())
+            tokens_local.append(full_tokens)
+            logprobs_local.append(full_logprobs)
+            prompt_lens_local.append(prompt_len)
+            action_lens_local.append(int(gen_tokens.shape[0]))
+            embeds_local.append(embeds)
+            grid_local.append(grid)
+            decoded = tokenizer.decode(gen_tokens.tolist(), skip_special_tokens=True)
+            responses_local.append(decoded)
+
+        _, _, returns_local, _, _ = env.step_list(states, actions)
+        returns_np = np.asarray(returns_local, dtype=np.float32)
+        returns_global = host_gather(shard_data_fn(returns_np))
+
+        stats["rollouts"] += float(len(returns_global))
+        if len(buffer_rewards) + len(returns_global) > 0:
+            total_rewards = buffer_rewards + returns_global.tolist()
+            stats["reward_mean"] = float(np.mean(total_rewards))
+
+        for token_arr, logprob_arr, rew, prompt_len, action_len, embeds, grid, text in zip(
+            tokens_local,
+            logprobs_local,
+            returns_global.tolist(),
+            prompt_lens_local,
+            action_lens_local,
+            embeds_local,
+            grid_local,
+            responses_local,
+            strict=True,
+        ):
+            if len(buffer_tokens) >= groups_per_batch:
+                break
+            buffer_tokens.append(token_arr)
+            buffer_logprobs.append(logprob_arr)
+            buffer_rewards.append(float(rew))
+            buffer_prompt_lens.append(int(prompt_len))
+            buffer_action_lens.append(int(action_len))
+            buffer_vis_embeds.append(embeds)
+            buffer_grid.append(grid)
+            buffer_texts.append(text)
+
+    tokens = _pad_sequences(buffer_tokens, pad_id)
+    sample_logprobs = _pad_float_sequences(buffer_logprobs)
+    prompt_lens_arr = np.asarray(buffer_prompt_lens, dtype=np.int32)
+    action_lens_arr = np.asarray(buffer_action_lens, dtype=np.int32)
+    mask = _build_masks(prompt_lens_arr, action_lens_arr, int(tokens.shape[1]))
+
+    vision_embeds = _pad_vision([np.asarray(v) for v in buffer_vis_embeds])
+    grid = _pad_grid([np.asarray(g) for g in buffer_grid])
+
+    rewards = jnp.asarray(buffer_rewards, dtype=jnp.float32)
+    advantages = rewards - rewards.mean()
+
+    batch = {
+        "tokens": tokens,
+        "mask": mask,
+        "sample_logprobs": sample_logprobs,
+        "advantages": advantages,
+        "rewards": rewards,
+        "vision_embeds": vision_embeds,
+        "grid": grid,
+        "responses": buffer_texts,
+    }
+
+    return rng, env_task_idx, batch, stats
 
 
 def main(_):
-    # Init flags and W&B
     FLAGS(sys.argv)
     if jax.process_index() == 0:
         setup_wandb(
@@ -159,44 +371,18 @@ def main(_):
             name=f"{FLAGS.env_name}-{FLAGS.wandb_name}",
             group=FLAGS.wandb_group,
         )
-        # Define a common x-axis and summaries so charts are consistent in W&B
-        try:
-            wandb.define_metric('global_step')
-            wandb.define_metric('*', step_metric='global_step')
-            # Task performance
-            wandb.define_metric('env/stage_acc', summary='max')
-            wandb.define_metric('env/is_correct', summary='max')
-            wandb.define_metric('env/country_correct', summary='mean')
-            wandb.define_metric('env/region_correct', summary='mean')
-            wandb.define_metric('env/city_correct', summary='mean')
-            wandb.define_metric('env/any_correct', summary='mean')
-            # Coordinates and distance
-            wandb.define_metric('env/distance_km', summary='mean')
-            wandb.define_metric('env/coords_within_tolerance', summary='mean')
-            # Structure & parsing
-            wandb.define_metric('env/format_ok', summary='mean')
-            wandb.define_metric('env/parsed_field_count', summary='mean')
-            # Reward & curriculum
-            wandb.define_metric('env/final_reward', summary='mean')
-            wandb.define_metric('env/hier_reward', summary='mean')
-            wandb.define_metric('env/geo_reward', summary='mean')
-            wandb.define_metric('env/stage_idx', summary='last')
-        except Exception:
-            pass
-        # Test wandb logging immediately
-        print("[WANDB DEBUG] Testing initial wandb.log...")
-        # Do not advance W&B step before training starts; buffer this entry
-        wandb.log({"test/initial_log": 1.0, "test/startup_time": time.time()}, commit=False)
-        print("[WANDB DEBUG] Initial test log completed")
 
-    # Load model and optimizer
-    ckpt_dir = FLAGS.model_dir
-    model, params = create_model_from_ckpt(ckpt_dir)
-    # Optimizer: default to Adafactor to dramatically reduce memory vs AdamW.
-    if str(getattr(FLAGS, 'optimizer', 'adafactor')).lower() == 'adamw':
+    model, params = create_model_from_ckpt(FLAGS.model_dir)
+    optimizer_name = str(getattr(FLAGS, "optimizer", "adafactor")).lower()
+    if optimizer_name == "adamw":
         tx = optax.chain(
             optax.clip_by_global_norm(1.0),
-            optax.adamw(FLAGS.lr, b1=0.9, b2=0.95, weight_decay=FLAGS.weight_decay),
+            optax.adamw(
+                learning_rate=FLAGS.lr,
+                b1=0.9,
+                b2=0.95,
+                weight_decay=FLAGS.weight_decay,
+            ),
         )
     else:
         tx = optax.chain(
@@ -205,163 +391,225 @@ def main(_):
                 learning_rate=FLAGS.lr,
                 min_dim_size_to_factor=32,
                 dtype_momentum=jnp.bfloat16,
-                weight_decay_rate=float(FLAGS.weight_decay) if float(FLAGS.weight_decay) > 0 else None,
+                weight_decay_rate=(
+                    float(FLAGS.weight_decay) if float(FLAGS.weight_decay) > 0 else None
+                ),
             ),
         )
     rng = jax.random.PRNGKey(0)
-    init_fn = partial(TrainState.create_with_params, model_def=model, tx=tx, use_ema=False)
-    # Create TrainState without JIT to avoid large compile-time IO of params/opt_state.
-    train_state = init_fn(rng=rng, params=params)
-    # Build sharding for update and helpers. Default to DP to reduce peak memory.
-    shard_mode = str(getattr(FLAGS, 'shard', 'dp')).lower()
-    train_state_shape = jax.eval_shape(lambda ts: ts, train_state)
-    train_state_shard, no_shard, data_shard, shard_data_fn = create_sharding(shard_mode, train_state_shape)
+    init_fn = lambda rng: TrainState.create_with_params(
+        model_def=model,
+        tx=tx,
+        params=params,
+        rng=rng,
+        use_ema=False,
+    )
+    train_state = init_fn(rng)
 
-    # Replicate train_state across all devices for multi-GPU with DP mode
-    # This avoids sharding issues with batch=1 sampling during rollouts
-    if shard_mode == 'dp':
+    shard_mode = str(getattr(FLAGS, "shard", "dp")).lower()
+    train_state_shape = jax.eval_shape(lambda ts: ts, train_state)
+    _train_state_shard, no_shard, data_shard, shard_data_fn = create_sharding(
+        shard_mode, train_state_shape
+    )
+    if shard_mode == "dp":
         train_state = jax.device_put(train_state, no_shard)
 
-    # Tokenizer and env
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=False)
-    pad_id = getattr(tokenizer, 'pad_token_id', None) or 0
-    eos_id = getattr(tokenizer, 'eos_token_id', None)
+    tokenizer = AutoTokenizer.from_pretrained(FLAGS.model_dir, trust_remote_code=False)
+    pad_id = getattr(tokenizer, "pad_token_id", None) or 0
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+
     env = create_env(FLAGS.env_name, tokenizer)
     env_test = create_env(FLAGS.test_env_name, tokenizer) if FLAGS.test_env_name else None
 
-    # Sampler for VLM generation
-    vlm_sampler = VLMSampler(model, params)
-    image_pad_id = _resolve_image_pad_id(tokenizer, ckpt_dir)
+    sampler = VLMSampler(model, train_state.params)
+    image_pad_id = _resolve_image_pad_id(tokenizer, FLAGS.model_dir)
 
-    # Derive min/max pixels and decode shortlist
-    vlm_min_pixels = _maybe_limit(FLAGS.vlm_min_pixels, DEFAULT_MIN_PIXELS)
-    vlm_max_pixels = _maybe_limit(FLAGS.vlm_max_pixels, DEFAULT_MAX_PIXELS)
-    top_k = int(FLAGS.top_k) if int(getattr(FLAGS, 'top_k', -1) or -1) > 0 else None
+    vlm_min_pixels = FLAGS.vlm_min_pixels if hasattr(FLAGS, "vlm_min_pixels") else -1
+    vlm_max_pixels = FLAGS.vlm_max_pixels if hasattr(FLAGS, "vlm_max_pixels") else -1
+    vlm_min_pixels = None if int(vlm_min_pixels) <= 0 else int(vlm_min_pixels)
+    vlm_max_pixels = None if int(vlm_max_pixels) <= 0 else int(vlm_max_pixels)
+
+    top_k = int(FLAGS.top_k) if int(getattr(FLAGS, "top_k", -1) or -1) > 0 else None
     top_p = float(FLAGS.top_p)
     top_p = top_p if (0.0 < top_p < 1.0) else None
-    temperature = float(getattr(FLAGS, 'temperature', 1.0) or 1.0)
+    temperature = float(getattr(FLAGS, "temperature", 1.0) or 1.0)
 
-    # GRPO rollout settings
     rollout_batch_size = jax.local_device_count() * int(FLAGS.inference_batch_per_device)
-    assert rollout_batch_size % int(FLAGS.group_size) == 0, "rollout_batch_size must be divisible by group_size"
     rng_global = jax.random.PRNGKey(jax.process_index())
-    total_rollouts = 0
-    env_num_tasks = env.num_tasks if env.num_tasks != -1 else 1_000_000
     env_task_idx = 0
 
-    # JIT compute of token logprobs under current params (teacher-forced)
-    def build_get_logprobs_core(model: Qwen25VLModel):
-        @partial(jax.jit, out_shardings=no_shard)
-        def get_logprobs_core(state: TrainState, token_batch, mask, vision_embeds, cos, sin):
-            # token_batch: [B, T]
-            text_input = token_batch[:, :-1]
-            text_target = token_batch[:, 1:]
-            mask_target = mask[:, 1:]  # align with targets
-            attn_mask = (text_input != pad_id).astype(jnp.int32)
-            logits, _ = state.call_model(text_input, vision_embeds, image_pad_id, cos, sin, mask=attn_mask, cache=None, method=model.forward_vlm)
+    @jax.jit
+    def _update(train_state, tokens, mask, advantages, sample_logprobs, vision_embeds, token_mask, cos, sin):
+        text_input = tokens[:, :-1]
+        text_target = tokens[:, 1:]
+        mask_tokens = mask[:, 1:]
+
+        def loss_fn(params):
+            logits, _ = train_state.call_model(
+                text_input,
+                vision_embeds,
+                image_pad_id,
+                cos,
+                sin,
+                mask=token_mask,
+                cache=None,
+                params=params,
+                method=model.forward_vlm,
+            )
             logprobs = jax.nn.log_softmax(logits, axis=-1)
-            token_logprobs = jnp.sum(logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
-            # return full sequence logprobs (masked by caller)
-            return token_logprobs * mask_target
+            token_logprobs = jnp.sum(
+                logprobs * jax.nn.one_hot(text_target, logits.shape[-1]),
+                axis=-1,
+            )
+            entropy = -jnp.sum(jax.nn.softmax(logits) * logprobs, axis=-1)
 
-        return get_logprobs_core
+            adv = advantages[:, None]
+            mask_total = jnp.sum(mask_tokens) + 1e-8
+            pg_loss = -jnp.sum(token_logprobs * adv * mask_tokens) / mask_total
+            entropy_loss = -FLAGS.entropy_coef * jnp.sum(entropy * mask_tokens) / mask_total
 
-    get_logprobs_core = build_get_logprobs_core(model)
+            if FLAGS.kl_coef and float(FLAGS.kl_coef) > 0:
+                old_logprobs = sample_logprobs[:, 1:]
+                kl_term = jnp.sum((token_logprobs - old_logprobs) * mask_tokens) / mask_total
+                kl_penalty = float(FLAGS.kl_coef) * kl_term
+            else:
+                kl_term = 0.0
+                kl_penalty = 0.0
 
-    # Main training loop
-    for step_idx in tqdm.tqdm(range(int(FLAGS.total_steps))):
+            loss = pg_loss + entropy_loss + kl_penalty
+            metrics = {
+                "loss": loss,
+                "loss_pg": pg_loss,
+                "loss_entropy": entropy_loss,
+                "kl_term": kl_term,
+                "mask_tokens": mask_total,
+                "entropy": jnp.sum(entropy * mask_tokens) / mask_total,
+                "token_logprob_mean": jnp.sum(token_logprobs * mask_tokens) / mask_total,
+            }
+            return loss, metrics
+
+        (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
+        updates, opt_state = train_state.tx.update(grads, train_state.opt_state, train_state.params)
+        new_params = optax.apply_updates(train_state.params, updates)
+        new_state = train_state.replace(
+            params=new_params,
+            opt_state=opt_state,
+            step=train_state.step + 1,
+        )
+        metrics = {**metrics, "grad_norm": optax.global_norm(grads)}
+        return new_state, metrics
+
+    for step_idx in range(int(FLAGS.total_steps)):
         if step_idx == 0 and jax.process_index() == 0:
-            print("[WANDB DEBUG] Starting training loop, first step...")
-        # Ensure the sampler uses the latest parameters for generation
-        # to avoid mismatch with vision embeddings computed from updated params.
-        vlm_sampler.params = train_state.params
-        # On-policy buffer
-        buffer_tokens: list[jnp.ndarray] = []
-        buffer_adv: list[jnp.ndarray] = []
-        buffer_inf_logprobs: list[jnp.ndarray] = []
-        buffer_prompt_lens: list[int] = []
-        buffer_action_lens: list[int] = []
-        buffer_vis_embeds: list[jnp.ndarray] = []
-        buffer_grid_thw: list[jnp.ndarray] = []
-        buffer_meta: list[dict] = []  # per-group meta for viz snapshot
+            wandb.define_metric("global_step")
+            wandb.define_metric("*", step_metric="global_step")
 
-        env_infos_history = {'return': []}
-        rollout_iters = 0
-        t_start_roll = time.time()
+        sampler.params = train_state.params
+        rng_global, env_task_idx, batch, rollout_stats = collect_rollouts(
+            train_state,
+            sampler,
+            env,
+            tokenizer,
+            model,
+            pad_id,
+            image_pad_id,
+            rng_global,
+            shard_data_fn,
+            rollout_batch_size,
+            int(FLAGS.groups_per_batch),
+            env_task_idx,
+            vlm_min_pixels,
+            vlm_max_pixels,
+            eos_id,
+            temperature,
+            top_k,
+            top_p,
+        )
 
-        while len(buffer_tokens) < int(FLAGS.groups_per_batch):
-            rollout_iters += 1
-            total_rollouts += rollout_batch_size * jax.process_count()
+        text_input = batch["tokens"][:, :-1]
+        token_mask = (text_input != pad_id).astype(jnp.int32)
+        pos3, _ = get_rope_index(
+            spatial_merge_size=model.spec.vision.spatial_merge_size,
+            input_ids=text_input,
+            image_grid_thw=batch["grid"],
+            video_grid_thw=None,
+            second_per_grid_ts=None,
+            attention_mask=token_mask,
+            tokens_per_second=float(model.spec.vision.tokens_per_second),
+        )
+        cos, sin = build_mrope(
+            pos3,
+            tuple(model.spec.text.rope_section),
+            float(model.spec.text.rope_theta),
+            dtype=model.dtype,
+            rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
+            rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
+        )
 
-            # Build a batch of groups (repeat each task group_size times)
-            group_env_states = []
-            group_obs = []
-            for _ in range(rollout_batch_size // int(FLAGS.group_size)):
-                env_state, obs = env.reset(min(env_task_idx + jax.process_index(), env_num_tasks - 1))
-                env_task_idx = (env_task_idx + jax.process_count()) % env_num_tasks
-                for _g in range(int(FLAGS.group_size)):
-                    group_env_states.append(env_state)
-                    group_obs.append(obs)
+        train_state, metrics = _update(
+            train_state,
+            batch["tokens"],
+            batch["mask"],
+            batch["advantages"],
+            batch["sample_logprobs"],
+            batch["vision_embeds"],
+            token_mask,
+            cos,
+            sin,
+        )
 
-            # Per-sample VLM sampling (batch=1 in sampler)
-            action_tokens_list: list[list[int]] = []
-            all_tokens_list: list[jnp.ndarray] = []
-            all_logprobs_list: list[jnp.ndarray] = []
-            prompt_lens_list: list[int] = []
-            action_lens_list: list[int] = []
-            vis_embeds_list: list[jnp.ndarray] = []
-            grid_list: list[jnp.ndarray] = []
+        info = {
+            "global_step": int(step_idx),
+            "reward/mean": float(batch["rewards"].mean()),
+            "reward/std": float(batch["rewards"].std()),
+            "advantage/std": float(batch["advantages"].std()),
+            "rollouts_per_step": rollout_stats["rollouts"],
+        }
+        info.update({f"train/{k}": float(v) for k, v in metrics.items()})
 
-            for obs in group_obs:
-                vision_spec = model.spec.vision
-                if vision_spec is None:
-                    raise ValueError("This VLM checkpoint has no vision backbone configured.")
+        if jax.process_index() == 0:
+            sample_reward = float(batch["rewards"][0]) if batch["rewards"].size > 0 else float("nan")
+            sample_text = batch["responses"][0] if batch["responses"] else ""
+            preview = sample_text if len(sample_text) <= 200 else sample_text[:200] + "..."
+            print(
+                f"[step {step_idx}] reward_mean={info['reward/mean']:.3f} "
+                f"reward_sample={sample_reward:.3f} loss={info.get('train/loss', float('nan')):.4f}"
+            )
+            if sample_text:
+                print(f"[step {step_idx}] sample response: {preview}")
+            wandb.log(info, commit=True)
 
-                # Build prompt + vision embeddings
-                if hasattr(obs, 'image_path') and hasattr(obs, 'question'):
-                    pix, grid = preprocess_image(
-                        obs.image_path,
-                        patch_size=vision_spec.patch_size,
-                        spatial_merge_size=vision_spec.spatial_merge_size,
-                        temporal_patch_size=vision_spec.temporal_patch_size,
-                        min_pixels=(vlm_min_pixels if (vlm_min_pixels and vlm_min_pixels > 0) else DEFAULT_MIN_PIXELS),
-                        max_pixels=(vlm_max_pixels if (vlm_max_pixels and vlm_max_pixels > 0) else DEFAULT_MAX_PIXELS),
-                    )
-                    embeds = model.apply({"params": train_state.params}, pix, grid, method=model.encode_vision)
-                    num_tokens = int(embeds.shape[0])
-                    prompt_text = chat_prompt_with_image(num_tokens, obs.question)
-                    input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-                    prompt_tokens = jnp.asarray([input_ids], dtype=jnp.int32)
-                elif hasattr(obs, 'image_left') and hasattr(obs, 'image_right') and hasattr(obs, 'statement'):
-                    pix_l, grid_l = preprocess_image(
-                        obs.image_left,
-                        patch_size=vision_spec.patch_size,
-                        spatial_merge_size=vision_spec.spatial_merge_size,
-                        temporal_patch_size=vision_spec.temporal_patch_size,
-                        min_pixels=(vlm_min_pixels if (vlm_min_pixels and vlm_min_pixels > 0) else DEFAULT_MIN_PIXELS),
-                        max_pixels=(vlm_max_pixels if (vlm_max_pixels and vlm_max_pixels > 0) else DEFAULT_MAX_PIXELS),
-                    )
-                    pix_r, grid_r = preprocess_image(
-                        obs.image_right,
-                        patch_size=vision_spec.patch_size,
-                        spatial_merge_size=vision_spec.spatial_merge_size,
-                        temporal_patch_size=vision_spec.temporal_patch_size,
-                        min_pixels=(vlm_min_pixels if (vlm_min_pixels and vlm_min_pixels > 0) else DEFAULT_MIN_PIXELS),
-                        max_pixels=(vlm_max_pixels if (vlm_max_pixels and vlm_max_pixels > 0) else DEFAULT_MAX_PIXELS),
-                    )
-                    emb_l = model.apply({"params": train_state.params}, pix_l, grid_l, method=model.encode_vision)
-                    emb_r = model.apply({"params": train_state.params}, pix_r, grid_r, method=model.encode_vision)
-                    embeds = jnp.concatenate([emb_l, emb_r], axis=0)
-                    grid = jnp.concatenate([grid_l, grid_r], axis=0)
-                    prompt_text = chat_prompt_with_images([int(emb_l.shape[0]), int(emb_r.shape[0])], f"Look at the two images. {obs.statement} True or False?")
-                    input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-                    prompt_tokens = jnp.asarray([input_ids], dtype=jnp.int32)
-                else:
-                    raise ValueError("Unsupported VLM observation structure")
+        if step_idx % int(FLAGS.save_interval) == 0 and FLAGS.save_dir and jax.process_index() == 0:
+            params_gather = host_gather(train_state.params)
+            ckpt_dir = f"{FLAGS.save_dir}/step{step_idx}/"
+            cp = Checkpoint(f"{ckpt_dir}params.pkl", parallel=False)
+            cp.params = params_gather
+            cp.save()
 
-                # Sample
+        if (
+            env_test is not None
+            and step_idx > 0
+            and step_idx % int(FLAGS.test_interval) == 0
+            and jax.process_index() == 0
+        ):
+            states, obs_batch = [], []
+            for _ in range(rollout_batch_size):
+                idx = min(env_task_idx + jax.process_index(), env.num_tasks - 1)
+                state, obs = env_test.reset(idx)
+                states.append(state)
+                obs_batch.append(obs)
+            actions = []
+            for obs in obs_batch:
+                prompt_tokens, embeds, grid = _prepare_prompt_and_embeds(
+                    model,
+                    train_state,
+                    tokenizer,
+                    obs,
+                    vlm_min_pixels,
+                    vlm_max_pixels,
+                )
                 rng_global, key = jax.random.split(rng_global)
-                generated, logprobs = vlm_sampler.sample_vlm(
+                generated, _ = sampler.sample_vlm(
                     prompt_tokens,
                     embeds,
                     grid,
@@ -373,760 +621,13 @@ def main(_):
                     eos_id=eos_id,
                     pad_id=pad_id,
                     rng=key,
-                    return_logprobs=True,
+                    return_logprobs=False,
                 )
-
-                gen_list = generated[0].tolist()
-                action_tokens_list.append(gen_list)
-                action_lens_list.append(len(gen_list))
-                prompt_lens_list.append(int(prompt_tokens.shape[1]))
-                # Validate and normalize shapes before caching
-                if embeds.ndim != 2:
-                    raise ValueError(f"encode_vision must return 2D [N,D] embeds, got {embeds.shape}")
-                vis_embeds_list.append(embeds)
-                if isinstance(grid, (list, tuple)):
-                    grid = jnp.asarray(grid)
-                if hasattr(grid, 'ndim'):
-                    if grid.ndim == 1 and int(grid.size) == 3:
-                        grid = grid[None, :]
-                    if grid.ndim != 2 or int(grid.shape[-1]) != 3:
-                        raise ValueError(f"grid_thw must be shape (num_images,3), got {tuple(grid.shape)}")
-                grid_list.append(grid)
-
-                all_tokens = jnp.concatenate([prompt_tokens, generated], axis=-1)
-                all_tokens_list.append(all_tokens[0])
-                # prepend zeros for prompt region
-                zeros = jnp.zeros((prompt_tokens.shape[1],), dtype=jnp.float32)
-                all_logprobs = jnp.concatenate([zeros, logprobs[0]], axis=0)
-                all_logprobs_list.append(all_logprobs)
-
-                # embeds shape already validated above
-
-            # Step environment
-            new_states, _, returns_local, dones, env_infos = env.step_list(group_env_states, action_tokens_list)
-            assert dones[0]
-            returns_local = np.array(returns_local)
-            returns = host_gather(shard_data_fn(returns_local))
-
-            # Only shard-gather values that are per-sample and align with device count.
-            for k, v in env_infos.items():
-                env_infos_history.setdefault(k, [])
-                try:
-                    # Convert to list and detect scalar numerics
-                    seq = list(v) if isinstance(v, (list, tuple)) else [v]
-                    # Treat as numeric only if all elements are scalars (int/float/bool)
-                    def _is_scalar_number(x):
-                        return isinstance(x, (int, float, bool, np.number)) and not isinstance(x, (list, tuple))
-                    is_numeric_seq = all(_is_scalar_number(x) for x in seq)
-
-                    expected_len = len(group_obs)
-                    can_shard = (
-                        is_numeric_seq and len(seq) == expected_len and expected_len > 0 and
-                        (expected_len % jax.device_count() == 0)
-                    )
-                    if can_shard:
-                        np_v = np.asarray(seq)
-                        v_global = host_gather(shard_data_fn(np_v))
-                        env_infos_history[k] += v_global.tolist()
-                    else:
-                        env_infos_history[k] += seq
-                except Exception:
-                    # Fallback to plain list extension to keep training robust
-                    try:
-                        env_infos_history[k] += list(v)
-                    except Exception:
-                        pass
-            env_infos_history['return'] += returns.tolist()
-
-            # Optional debug print/log of a few samples
-            if int(getattr(FLAGS, 'debug_print_samples', 0)):
-                try:
-                    n_dbg = int(getattr(FLAGS, 'debug_samples_n', 2) or 2)
-                    n_dbg = min(n_dbg, len(group_obs))
-                    responses = env_infos.get('response', [''] * len(group_obs))
-                    for i in range(n_dbg):
-                        o = group_obs[i]
-                        resp = responses[i] if i < len(responses) else ''
-                        kws = getattr(o, 'keywords', ())
-                        q = getattr(o, 'question', '')
-                        img = getattr(o, 'image_path', '')
-                        rew = float(returns_local[i]) if i < len(returns_local) else float('nan')
-                        print("\n[DEBUG SAMPLE]")
-                        print(f"Q: {q}")
-                        if img:
-                            print(f"Image: {img}")
-                        print(f"Keywords: {', '.join(kws) if kws else '(none)'}")
-                        print(f"Response: {resp}")
-                        print(f"Reward: {rew:.3f}")
-                except Exception as _e:
-                    # Keep debug non-fatal
-                    pass
-
-            if int(getattr(FLAGS, 'debug_log_wandb_samples', 0)) and jax.process_index() == 0:
-                try:
-                    import wandb as _wandb
-                    n_dbg = int(getattr(FLAGS, 'debug_samples_n', 2) or 2)
-                    n_dbg = min(n_dbg, len(group_obs))
-                    responses = env_infos.get('response', [''] * len(group_obs))
-                    rows = []
-                    for i in range(n_dbg):
-                        o = group_obs[i]
-                        resp = responses[i] if i < len(responses) else ''
-                        q = getattr(o, 'question', '')
-                        kws = ', '.join(getattr(o, 'keywords', ()))
-                        img = getattr(o, 'image_path', '')
-                        rew = float(returns_local[i]) if i < len(returns_local) else float('nan')
-                        rows.append([int(step_idx), q, kws, resp, rew, img])
-                    if rows:
-                        tbl = _wandb.Table(columns=[
-                            'step', 'question', 'keywords', 'response', 'reward', 'image_path'
-                        ], data=rows)
-                        _wandb.log({'debug/samples': tbl}, commit=False)
-                except Exception:
-                    pass
-
-            # Compute advantages per group
-            returns = jnp.reshape(returns, (-1, int(FLAGS.group_size)))
-            adv = returns
-            
-            # Log raw reward statistics before normalization
-            returns_flat = np.asarray(returns).flatten()
-            if jax.process_index() == 0:
-                env_infos_history.setdefault('rewards/mean', []).append(float(np.mean(returns_flat)))
-                env_infos_history.setdefault('rewards/std', []).append(float(np.std(returns_flat)))
-                env_infos_history.setdefault('rewards/min', []).append(float(np.min(returns_flat)))
-                env_infos_history.setdefault('rewards/max', []).append(float(np.max(returns_flat)))
-                env_infos_history.setdefault('rewards/median', []).append(float(np.median(returns_flat)))
-            
-            if int(FLAGS.do_group_normalization):
-                gm = np.mean(adv, axis=-1)
-                gs = np.std(adv, axis=-1) + 1e-8
-                adv = (adv - gm[:, None]) / gs[:, None]
-            if int(FLAGS.do_global_normalization):
-                gmean = np.mean(adv)
-                gstd = np.std(adv) + 1e-8
-                adv = (adv - gmean) / gstd
-            if int(FLAGS.do_clip_advantages):
-                adv = np.clip(adv, a_min=0.0, a_max=None)
-            
-            # Log advantage statistics after normalization
-            adv_flat = np.asarray(adv).flatten()
-            if jax.process_index() == 0:
-                env_infos_history.setdefault('advantages/mean', []).append(float(np.mean(adv_flat)))
-                env_infos_history.setdefault('advantages/std', []).append(float(np.std(adv_flat)))
-                env_infos_history.setdefault('advantages/min', []).append(float(np.min(adv_flat)))
-                env_infos_history.setdefault('advantages/max', []).append(float(np.max(adv_flat)))
-
-            # Flatten back and filter groups where all adv == 0 (optional)
-            all_tokens_arr = _pad_right(all_tokens_list, pad_val=pad_id, axis=0)
-            all_logprobs_arr = _pad_right(all_logprobs_list, pad_val=0.0, axis=0)
-            adv_grouped = adv.reshape(-1, int(FLAGS.group_size))
-            tokens_grouped = all_tokens_arr.reshape(-1, int(FLAGS.group_size), all_tokens_arr.shape[-1])
-            logprobs_grouped = all_logprobs_arr.reshape(-1, int(FLAGS.group_size), all_logprobs_arr.shape[-1])
-            # For scalar lists, manual indexing is safer than object np.reshape
-            # Keep prompt/action lens as flat lists and index via base_idx
-            # Preserve vision embeddings and grid_thw as JAX arrays by avoiding np.reshape on object arrays
-            returns_grouped = np.array(returns).reshape(-1, int(FLAGS.group_size))
-
-            # Capture per-sample env outputs for this rollout
-            responses = env_infos.get('response', [''] * len(group_obs)) if isinstance(env_infos, dict) else [''] * len(group_obs)
-            predicted_flags = env_infos.get('predicted', [None] * len(group_obs)) if isinstance(env_infos, dict) else [None] * len(group_obs)
-
-            group_size_val = int(FLAGS.group_size)
-            num_groups = int(adv_grouped.shape[0])
-            for g in range(num_groups):
-                if int(FLAGS.do_group_filter) and np.all(adv_grouped[g] == 0):
-                    continue
-                buffer_tokens.append(tokens_grouped[g])
-                buffer_adv.append(adv_grouped[g])
-                buffer_inf_logprobs.append(logprobs_grouped[g])
-                base_idx = g * group_size_val
-                buffer_prompt_lens.append(int(prompt_lens_list[base_idx]))  # same per group
-                buffer_action_lens.append(int(action_lens_list[base_idx]))  # same per group
-                # store one set per group (identical across members)
-                buffer_vis_embeds.append(vis_embeds_list[base_idx])
-                # Normalize grid_thw to at least 2D (num_images, 3)
-                _grid = grid_list[base_idx]
-                try:
-                    _grid_arr = jnp.asarray(_grid)
-                    if _grid_arr.ndim == 1 and _grid_arr.size == 3:
-                        _grid_arr = _grid_arr[None, :]
-                except Exception:
-                    _grid_arr = _grid  # keep original; _pad_right will surface details if problematic
-                buffer_grid_thw.append(_grid_arr)
-                # snapshot meta (use the first obs of this group)
-                try:
-                    o = group_obs[base_idx]
-                    meta = {
-                        'statement': getattr(o, 'statement', ''),
-                        'label': bool(getattr(o, 'label', False)),
-                        'image_left': getattr(o, 'image_left', None),
-                        'image_right': getattr(o, 'image_right', None),
-                        'returns': returns_grouped[g].tolist(),
-                        'advantages': adv_grouped[g].tolist(),
-                        'responses': [responses[base_idx + k] if base_idx + k < len(responses) else '' for k in range(int(FLAGS.group_size))],
-                        'predicted': [bool(predicted_flags[base_idx + k]) if base_idx + k < len(predicted_flags) and predicted_flags[base_idx + k] is not None else None for k in range(int(FLAGS.group_size))],
-                    }
-                    buffer_meta.append(meta)
-                except Exception:
-                    buffer_meta.append({'statement': '', 'label': None, 'image_left': None, 'image_right': None, 'returns': [], 'advantages': [], 'responses': [], 'predicted': []})
-
-            if jax.process_index() == 0:
-                print(f"Buffer groups: {len(buffer_tokens)}. Return avg: {float(np.mean(returns)):.4f}")
-
-        # Construct global batch tensors (pad to right across buffered groups)
-        # buffer_tokens elements are shape (group_size, T_i) with varying T_i.
-        # Pad along the token dimension (axis=1), then flatten groups to 2D.
-        tokens_all_3d = _pad_right(buffer_tokens, pad_val=pad_id, axis=1)
-        tokens_all = tokens_all_3d.reshape(-1, tokens_all_3d.shape[-1])
-
-        # Same treatment for inference logprobs so shapes match tokens_all.
-        inf_lp_3d = _pad_right(buffer_inf_logprobs, pad_val=0.0, axis=1)
-        inference_logprobs_all = inf_lp_3d.reshape(-1, inf_lp_3d.shape[-1])
-
-        # Advantages were collected as (group_size,) so concatenation is fine.
-        advantages_all = jnp.concatenate(buffer_adv, axis=0)
-
-        # Derive actual batch size from what we buffered (robust to filtering)
-        global_batch_size = int(tokens_all.shape[0])
-
-        # Build generation mask per-sample (only learned on generated tokens)
-        prompt_lens_arr = np.array(buffer_prompt_lens, dtype=np.int32)
-        action_lens_arr = np.array(buffer_action_lens, dtype=np.int32)
-        prompt_lens_arr = np.repeat(prompt_lens_arr, int(FLAGS.group_size))[:global_batch_size]
-        action_lens_arr = np.repeat(action_lens_arr, int(FLAGS.group_size))[:global_batch_size]
-        T = int(tokens_all.shape[-1])
-        mask = np.zeros((global_batch_size, T), dtype=np.int32)
-        for b in range(global_batch_size):
-            st = int(prompt_lens_arr[b]) - 1
-            ln = max(int(action_lens_arr[b]) - 1, 0)
-            ed = min(st + ln, T - 1)
-            if st >= 0 and ed >= st:
-                mask[b, st:ed + 1] = 1
-        mask = jnp.asarray(mask, dtype=jnp.int32)
-
-        # Minibatch over flat indices; build per-sample vision context
-        mb_size = int(FLAGS.ppo_minibatch)
-        mb_count = (global_batch_size + mb_size - 1) // mb_size
-
-        def pack_vision_samples(sample_indices):
-            # Map sample index -> group index, then replicate group vision embeds per sample
-            embeds_list = []
-            grid_list_local = []
-            for sidx in sample_indices:
-                gidx = int(sidx) // int(FLAGS.group_size)
-                embeds_list.append(buffer_vis_embeds[gidx])
-                grid_list_local.append(buffer_grid_thw[gidx])
-            emb_batch = _pad_right(embeds_list, pad_val=0.0, axis=0)
-            grd_batch = _pad_right(grid_list_local, pad_val=0, axis=0)
-            return emb_batch, grd_batch
-
-        # First pass: recompute logprobs per minibatch
-        recalc_chunks = []
-        for j in range(mb_count):
-            st = j * mb_size
-            ed = min((j + 1) * mb_size, global_batch_size)
-            idxs = list(range(st, ed))
-            tokens_mb = tokens_all[st:ed]
-            mask_mb = mask[st:ed]
-            embeds_mb, grid_mb = pack_vision_samples(idxs)
-            # Precompute cos/sin outside jit for JAX-safety
-            text_input_mb = tokens_mb[:, :-1]
-            token_mask_mb = (text_input_mb != pad_id).astype(jnp.int32)
-            pos3_mb, _ = get_rope_index(
-                spatial_merge_size=model.spec.vision.spatial_merge_size,
-                input_ids=text_input_mb,
-                image_grid_thw=grid_mb,
-                video_grid_thw=None,
-                second_per_grid_ts=None,
-                attention_mask=token_mask_mb,
-                tokens_per_second=float(model.spec.vision.tokens_per_second),
-            )
-            cos_mb, sin_mb = build_mrope(
-                pos3_mb,
-                tuple(model.spec.text.rope_section),
-                float(model.spec.text.rope_theta),
-                dtype=model.dtype,
-                rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
-                rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
-            )
-            recalc = get_logprobs_core(train_state, tokens_mb, mask_mb, embeds_mb, cos_mb, sin_mb)
-            recalc_chunks.append(recalc)
-        recalc_logprobs_all = jnp.concatenate(recalc_chunks, axis=0)
-
-        # Optional: emit a viz snapshot JSON for the first buffered group
-        snapshot_out = os.environ.get('GRPO_SNAPSHOT_OUT')
-        if snapshot_out and buffer_tokens:
-            try:
-                group_index = int(os.environ.get('GRPO_SNAPSHOT_GROUP', '0') or 0)
-            except Exception:
-                group_index = 0
-            group_index = max(0, min(group_index, len(buffer_tokens) - 1))
-            # Build per-sample indices for this group in the flattened arrays
-            gsz = int(FLAGS.group_size)
-            s_start = group_index * gsz
-            s_end = s_start + gsz
-            # compute per-sample ratios (exp of sum of logprob deltas over mask)
-            inf_mb = _pad_right([buffer_inf_logprobs[group_index]], pad_val=0.0, axis=1)[0]
-            rec_mb = recalc_logprobs_all[s_start:s_end]
-            mask_mb = mask[s_start:s_end]
-            ratio_list = []
-            for b in range(gsz):
-                dlp = (rec_mb[b] - inf_mb[b]) * mask_mb[b]
-                ratio = float(np.exp(np.sum(np.asarray(dlp))))
-                ratio_list.append(ratio)
-            eps = float(getattr(FLAGS, 'clip_epsilon', 0.2) or 0.2)
-            # Save images (if PIL) next to snapshot
-            out_path = Path(snapshot_out)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            meta = buffer_meta[group_index] if group_index < len(buffer_meta) else {}
-            stmt = meta.get('statement', '')
-            img_l = meta.get('image_left', None)
-            img_r = meta.get('image_right', None)
-            img_l_path = None
-            img_r_path = None
-            try:
-                if img_l is not None and hasattr(img_l, 'save'):
-                    img_l_path = out_path.parent / f"group{group_index}_left.png"
-                    img_l.save(img_l_path)
-                    img_l_path = str(img_l_path)
-            except Exception:
-                img_l_path = None
-            try:
-                if img_r is not None and hasattr(img_r, 'save'):
-                    img_r_path = out_path.parent / f"group{group_index}_right.png"
-                    img_r.save(img_r_path)
-                    img_r_path = str(img_r_path)
-            except Exception:
-                img_r_path = None
-            # Assemble samples
-            rewards = meta.get('returns', [])
-            advantages = meta.get('advantages', [])
-            responses = meta.get('responses', [])
-            predicted = meta.get('predicted', [])
-            samples = []
-            for i in range(gsz):
-                r = float(rewards[i]) if i < len(rewards) else 0.0
-                a = float(advantages[i]) if i < len(advantages) else 0.0
-                ratio = ratio_list[i] if i < len(ratio_list) else 1.0
-                ratio_clip = float(np.clip(ratio, 1.0 - eps, 1.0 + eps))
-                within_clip = bool(abs(1.0 - ratio) <= eps)
-                samples.append({
-                    'sample_idx': i,
-                    'image_files': [img_l_path, img_r_path],
-                    'reward': r,
-                    'advantage': a,
-                    'ppo_ratio': ratio,
-                    'ratio_clipped': ratio_clip,
-                    'within_clip': within_clip,
-                    'prediction_text': responses[i] if i < len(responses) else None,
-                    'predicted': (bool(predicted[i]) if i < len(predicted) and predicted[i] is not None else None),
-                })
-            # Baseline = true group mean reward
-            baseline = float(np.mean(np.asarray(rewards))) if rewards else 0.0
-            adv_flavor = 'group_norm' if int(FLAGS.do_group_normalization) else ('global_norm' if int(FLAGS.do_global_normalization) else 'raw')
-            snapshot = {
-                'step': int(step_idx),
-                'env': str(FLAGS.env_name),
-                'group_id': int(group_index),
-                'statement': stmt,
-                'baseline_mean_reward': baseline,
-                'advantage_flavor': adv_flavor,
-                'samples': samples,
-                'log_lines': [],
-                'label': meta.get('label', None),
-            }
-        else:
-            snapshot = None
-
-        # JIT PPO update using text-style objective but VLM logprobs
-        @partial(jax.jit, out_shardings=(train_state_shard, None))
-        def update(state: TrainState, token_batch, mask_origin, advantages, recalc_logprobs, inference_logprobs, vision_embeds_mb, cos_mb, sin_mb):
-            text_input, text_target = token_batch[:, :-1], token_batch[:, 1:]
-            inference_logprobs = inference_logprobs[:, 1:]
-            mask_origin = mask_origin[:, 1:]
-            token_mask = (text_input != pad_id).astype(jnp.int32)
-
-            def loss_fn(grad_params):
-                # Recompute logits (teacher-forced)
-                logits, _ = state.call_model(text_input, vision_embeds_mb, image_pad_id, cos_mb, sin_mb, mask=token_mask, cache=None, params=grad_params, method=model.forward_vlm)
-                all_logprobs = jax.nn.log_softmax(logits)
-                token_logprobs = jnp.sum(all_logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
-                entropy = -jnp.sum(jax.nn.softmax(logits) * all_logprobs, axis=-1)
-
-                old_logprobs = jnp.where(int(FLAGS.do_inference_logprobs) == 1, inference_logprobs, recalc_logprobs)
-                logratio = token_logprobs - old_logprobs
-                ratio = jnp.exp(logratio)
-                
-                # Compute PPO metrics
-                def avg_over_mask(x):
-                    return jnp.sum(x * mask_origin) / (jnp.sum(mask_origin) + 1e-8)
-                
-                # Approx KL divergence: mean(ratio - 1 - log(ratio))
-                approx_kl = avg_over_mask(ratio - 1.0 - logratio)
-                
-                # Ratio statistics
-                ratio_mean = avg_over_mask(ratio)
-                ratio_clipped = jnp.clip(ratio, 1.0 - FLAGS.clip_epsilon, 1.0 + FLAGS.clip_epsilon)
-                ratio_clipped_frac = avg_over_mask((jnp.abs(ratio - ratio_clipped) > 1e-6).astype(jnp.float32))
-                
-                if int(FLAGS.do_ppo_all_clip):
-                    pg_loss = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon, 1 + FLAGS.clip_epsilon)
-                else:
-                    pg_loss1 = -advantages[:, None] * ratio
-                    pg_loss2 = -advantages[:, None] * jnp.clip(ratio, 1 - FLAGS.clip_epsilon, 1 + FLAGS.clip_epsilon)
-                    pg_loss = jnp.maximum(pg_loss1, pg_loss2)
-
-                entropy_avg = avg_over_mask(entropy)
-                loss_pg = jnp.mean(pg_loss * mask_origin)
-                loss_ent = -entropy_avg * float(FLAGS.entropy_coef)
-                loss = loss_pg + loss_ent
-                return loss, {
-                    'loss': loss,
-                    'loss_pg': loss_pg,
-                    'loss_ent': loss_ent,
-                    'entropy': entropy_avg,
-                    'ppo/approx_kl': approx_kl,
-                    'ppo/ratio_mean': ratio_mean,
-                    'ppo/ratio_clipped_frac': ratio_clipped_frac,
-                }
-
-            grads, info = jax.grad(loss_fn, has_aux=True)(state.params)
-            updates, opt_state = state.tx.update(grads, state.opt_state, state.params)
-            new_params = optax.apply_updates(state.params, updates)
-            state = state.replace(params=new_params, opt_state=opt_state, step=state.step + 1)
-            info['grad_norm'] = optax.global_norm(grads)
-            info['update_norm'] = optax.global_norm(updates)
-            info['param_norm'] = optax.global_norm(new_params)
-            return state, info
-
-        # Training loop over minibatches
-        t_update_start = time.time()
-
-        # Accumulate metrics across minibatches
-        accumulated_metrics = {}
-
-        for j in range(mb_count):
-            st = j * mb_size
-            ed = min((j + 1) * mb_size, global_batch_size)
-            idxs = list(range(st, ed))
-            tokens_mb = tokens_all[st:ed]
-            mask_mb = mask[st:ed]
-            adv_mb = advantages_all[st:ed]
-            inf_lp_mb = inference_logprobs_all[st:ed]
-            recalc_mb = recalc_logprobs_all[st:ed]
-            embeds_mb, grid_mb = pack_vision_samples(idxs)
-            # Precompute cos/sin outside jit to avoid dynamic boolean indexing
-            text_input_mb = tokens_mb[:, :-1]
-            token_mask_mb = (text_input_mb != pad_id).astype(jnp.int32)
-            pos3_mb, _ = get_rope_index(
-                spatial_merge_size=model.spec.vision.spatial_merge_size,
-                input_ids=text_input_mb,
-                image_grid_thw=grid_mb,
-                video_grid_thw=None,
-                second_per_grid_ts=None,
-                attention_mask=token_mask_mb,
-                tokens_per_second=float(model.spec.vision.tokens_per_second),
-            )
-            cos_mb, sin_mb = build_mrope(
-                pos3_mb,
-                tuple(model.spec.text.rope_section),
-                float(model.spec.text.rope_theta),
-                dtype=model.dtype,
-                rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
-                rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
-            )
-            train_state, info = update(
-                train_state,
-                tokens_mb,
-                mask_mb,
-                adv_mb,
-                recalc_mb,
-                inf_lp_mb,
-                embeds_mb,
-                cos_mb,
-                sin_mb,
-            )
-            info = jax.device_get(info)
-            info = jax.tree.map(lambda x: np.array(x), info)
-            info = jax.tree.map(lambda x: x.mean(), info)
-
-            # Accumulate training metrics
-            for key, value in info.items():
-                if key not in accumulated_metrics:
-                    accumulated_metrics[key] = []
-                accumulated_metrics[key].append(value)
-
-        # Average the accumulated metrics
-        info = {}
-        for key, values in accumulated_metrics.items():
-            info[key] = float(np.mean(values))
-
-        # Add non-training metrics
-        info['total_rollouts'] = total_rollouts
-        if env.num_tasks != -1:
-            info['env_epochs'] = total_rollouts / env_num_tasks
-        info['rollout_iters_per_update'] = rollout_iters
-        info['global_step'] = step_idx
-        info['times/time_per_inference_iteration'] = (time.time() - t_start_roll) / max(rollout_iters, 1)
-        info['times/time_per_rollout'] = (time.time() - t_start_roll) / max(rollout_iters * rollout_batch_size * jax.host_count(), 1)
-        info['times/total_time_rollouts'] = time.time() - t_start_roll
-        info['times/total_time_update'] = time.time() - t_update_start
-        info['minibatches_per_global_step'] = int(mb_count)
-
-        # Extract learning rate from optimizer state
-        try:
-            if hasattr(train_state.opt_state, 'hyperparams'):
-                # AdamW-style optimizer
-                lr = float(train_state.opt_state.hyperparams.get('learning_rate', FLAGS.lr))
-            elif hasattr(train_state.opt_state, 'count'):
-                # Adafactor-style - use config LR
-                lr = float(FLAGS.lr)
-            else:
-                lr = float(FLAGS.lr)
-            info['training/learning_rate'] = lr
-        except Exception:
-            info['training/learning_rate'] = float(FLAGS.lr)
-        # Debug: print keys in env_infos_history
-        if jax.process_index() == 0 and step_idx == 0:
-            print(f"[WANDB DEBUG] env_infos_history keys: {list(env_infos_history.keys())}")
-            print(f"[WANDB DEBUG] Sample counts: {[(k, len(v) if isinstance(v, (list, tuple)) else 1) for k, v in list(env_infos_history.items())[:5]]}")
-
-        for k, v in env_infos_history.items():
-            if isinstance(v, (list, tuple)):
-                vals = v
-            else:
-                vals = list(v)
-            # avoid large text blobs in logs; only mean for numeric
-            try:
-                vals_np = np.array(vals)
-                if vals_np.dtype.kind in {'i', 'u', 'f'}:
-                    info[f'env/{k}'] = float(np.mean(vals_np))
-                    if jax.process_index() == 0 and step_idx == 0:
-                        print(f"[WANDB DEBUG] Logged metric: env/{k} = {float(np.mean(vals_np)):.4f}")
-                elif jax.process_index() == 0 and step_idx == 0:
-                    print(f"[WANDB DEBUG] Skipped metric '{k}': dtype.kind={vals_np.dtype.kind} (not numeric)")
-            except Exception as e:
-                if jax.process_index() == 0 and step_idx == 0:
-                    print(f"[WANDB DEBUG] Failed to process metric '{k}': {type(e).__name__}: {e}")
-
-        # ============= ENHANCED HOLISTIC METRICS =============
-        # Calculate additional metrics for better tracking of model improvements
-        
-        # Distance threshold metrics - track pass rates at various tolerances
-        if 'distance_km' in env_infos_history:
-            distances = np.array(env_infos_history['distance_km'])
-            if len(distances) > 0:
-                # Calculate pass rates for common distance thresholds
-                info['env/within_10km'] = float(np.mean(distances <= 10))
-                info['env/within_25km'] = float(np.mean(distances <= 25))
-                info['env/within_50km'] = float(np.mean(distances <= 50))
-                info['env/within_100km'] = float(np.mean(distances <= 100))
-                info['env/within_250km'] = float(np.mean(distances <= 250))
-                info['env/within_500km'] = float(np.mean(distances <= 500))
-                info['env/within_1000km'] = float(np.mean(distances <= 1000))
-                
-                # Distance percentiles for better understanding of distribution
-                info['env/distance_p25'] = float(np.percentile(distances, 25))
-                info['env/distance_p50'] = float(np.percentile(distances, 50))  # median
-                info['env/distance_p75'] = float(np.percentile(distances, 75))
-                info['env/distance_p90'] = float(np.percentile(distances, 90))
-        
-        # Format success rate - aggregate multiple format indicators
-        format_indicators = []
-        for key in ['format_ok', 'has_country', 'has_region', 'has_city', 'country_valid']:
-            if key in env_infos_history:
-                format_indicators.append(np.array(env_infos_history[key]))
-        
-        if format_indicators:
-            # Overall format health score (average of all format indicators)
-            format_health = np.mean([np.mean(ind) for ind in format_indicators])
-            info['env/format_health_score'] = float(format_health)
-        
-        # Hierarchical accuracy progression - track improvement ratios
-        hier_keys = ['country_correct', 'region_correct', 'city_correct']
-        hier_values = []
-        for key in hier_keys:
-            if key in env_infos_history:
-                vals = np.array(env_infos_history[key])
-                if len(vals) > 0:
-                    hier_values.append(float(np.mean(vals)))
-        
-        if hier_values:
-            # Calculate hierarchical progression score
-            # Weighted by difficulty: country=1, region=2, city=3
-            weights = [1.0, 2.0, 3.0][:len(hier_values)]
-            hier_score = sum(v * w for v, w in zip(hier_values, weights)) / sum(weights)
-            info['env/hierarchical_score'] = float(hier_score)
-        
-        # Success rate metrics - track different success criteria
-        if 'stage_acc' in env_infos_history:
-            stage_accs = np.array(env_infos_history['stage_acc'])
-            if len(stage_accs) > 0:
-                # Success rate (percentage of fully correct predictions)
-                info['env/success_rate'] = float(np.mean(stage_accs))
-                # High confidence predictions (rewards > 0.5)
-                if 'return' in env_infos_history:
-                    rewards = np.array(env_infos_history['return'])
-                    info['env/high_confidence_rate'] = float(np.mean(rewards > 0.5))
-        
-        # Coordinate prediction quality score
-        coord_quality_indicators = []
-        for key in ['has_coords', 'coords_in_range', 'coords_within_tolerance']:
-            if key in env_infos_history:
-                coord_quality_indicators.append(np.array(env_infos_history[key]))
-        
-        if coord_quality_indicators:
-            # Coordinate quality score (weighted average)
-            # has_coords=1, in_range=2, within_tolerance=3
-            weights = [1.0, 2.0, 3.0][:len(coord_quality_indicators)]
-            coord_scores = [float(np.mean(ind)) for ind in coord_quality_indicators]
-            coord_quality = sum(s * w for s, w in zip(coord_scores, weights)) / sum(weights)
-            info['env/coord_quality_score'] = float(coord_quality)
-        
-        # Overall improvement score - combines multiple metrics
-        improvement_components = []
-        if 'env/success_rate' in info:
-            improvement_components.append(info['env/success_rate'])
-        if 'env/format_health_score' in info:
-            improvement_components.append(info['env/format_health_score'])
-        if 'env/hierarchical_score' in info:
-            improvement_components.append(info['env/hierarchical_score'])
-        if 'env/coord_quality_score' in info:
-            improvement_components.append(info['env/coord_quality_score'])
-        
-        if improvement_components:
-            info['env/overall_improvement_score'] = float(np.mean(improvement_components))
-        
-        # Track improvement rate if we have historical data
-        # (This would need a persistent history across steps - simplified version here)
-        if step_idx > 0 and 'env/overall_improvement_score' in info:
-            # Log the current score for tracking trends
-            info['env/improvement_trend'] = info['env/overall_improvement_score']
-
-        # Enhanced response logging with W&B tables
-        if jax.process_index() == 0:
-            try:
-                responses = env_infos_history.get('response', [])
-                rewards = env_infos_history.get('return', [])
-                if responses and rewards and len(responses) == len(rewards):
-                    # Find best and worst samples
-                    rewards_arr = np.array(rewards)
-                    n_samples = min(5, len(rewards))  # Log top 5 and bottom 5
-
-                    # Get indices of best and worst
-                    best_idxs = np.argsort(rewards_arr)[-n_samples:][::-1]
-                    worst_idxs = np.argsort(rewards_arr)[:n_samples]
-
-                    # Build table data
-                    table_rows = []
-                    for idx in best_idxs:
-                        table_rows.append([
-                            int(step_idx),
-                            "best",
-                            float(rewards[idx]),
-                            str(responses[idx])[:500],  # Truncate long responses
-                            env_infos_history.get('predicted', [None] * len(rewards))[idx] if 'predicted' in env_infos_history else None,
-                        ])
-                    for idx in worst_idxs:
-                        table_rows.append([
-                            int(step_idx),
-                            "worst",
-                            float(rewards[idx]),
-                            str(responses[idx])[:500],
-                            env_infos_history.get('predicted', [None] * len(rewards))[idx] if 'predicted' in env_infos_history else None,
-                        ])
-
-                    if table_rows:
-                        response_table = wandb.Table(
-                            columns=['step', 'category', 'reward', 'response', 'predicted'],
-                            data=table_rows
-                        )
-                        info['samples/responses'] = response_table
-            except Exception as e:
-                # Keep non-fatal
-                pass
-
-            print(f"[WANDB DEBUG] Step {step_idx}: About to log {len(info)} metrics to wandb")
-            print(f"[WANDB DEBUG] Sample metrics: loss={info.get('loss', 'N/A'):.4f}, lr={info.get('training/learning_rate', 'N/A')}")
-            print(f"[WANDB DEBUG] wandb.run active: {wandb.run is not None}")
-            # Rely on 'global_step' metric for x-axis; avoid passing 'step' to keep steps monotonic
-            wandb.log(info, commit=True)
-            print(f"[WANDB DEBUG] wandb.log() completed for step {step_idx}")
-            # If building a viz snapshot, append a few numeric lines now that we have update stats
-            if snapshot is not None and snapshot.get('log_lines') is not None and len(snapshot['log_lines']) < 1:
-                try:
-                    gn = float(info.get('grad_norm', 0.0))
-                    un = float(info.get('update_norm', 0.0))
-                    snapshot['grad_norm'] = gn
-                    snapshot['update_norm'] = un
-                    snapshot['log_lines'] += [
-                        f"baseline_mean_reward={snapshot.get('baseline_mean_reward', 0.0):.3f}",
-                        f"grad_norm={gn:.3f}",
-                        f"update_norm={un:.3f}",
-                    ]
-                except Exception:
-                    pass
-
-        # Finally, write snapshot JSON once per step (if requested)
-        if snapshot is not None and jax.process_index() == 0:
-            try:
-                with open(os.environ['GRPO_SNAPSHOT_OUT'], 'w') as f:
-                    json.dump(snapshot, f)
-                print(f"[viz] wrote GRPO snapshot → {os.environ['GRPO_SNAPSHOT_OUT']}")
-            except Exception as e:
-                print(f"[viz] failed to write GRPO snapshot: {e}")
-
-        # Optional eval on a test env
-        if step_idx % int(FLAGS.test_interval) == 0 and env_test is not None:
-            # Run a quick single batch of rollouts and log avg reward
-            states, obs = [], []
-            for _ in range(rollout_batch_size):
-                s, o = env_test.reset(min(env_task_idx + jax.process_index(), env_num_tasks - 1))
-                env_task_idx = (env_task_idx + jax.process_count()) % env_num_tasks
-                states.append(s)
-                obs.append(o)
-            actions = []
-            for o in obs:
-                vision_spec = model.spec.vision
-                if hasattr(o, 'image_path') and hasattr(o, 'question'):
-                    pix, grid = preprocess_image(
-                        o.image_path,
-                        patch_size=vision_spec.patch_size,
-                        spatial_merge_size=vision_spec.spatial_merge_size,
-                        temporal_patch_size=vision_spec.temporal_patch_size,
-                    )
-                    embeds = model.apply({"params": train_state.params}, pix, grid, method=model.encode_vision)
-                    num_tokens = int(embeds.shape[0])
-                    prompt_text = chat_prompt_with_image(num_tokens, o.question)
-                    input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-                    prompt_tokens = jnp.asarray([input_ids], dtype=jnp.int32)
-                    rng_local = jax.random.PRNGKey(step_idx)
-                    gen, _ = vlm_sampler.sample_vlm(
-                        prompt_tokens, embeds, grid, image_pad_id,
-                        max_new_tokens=int(FLAGS.num_generation_tokens),
-                        temperature=temperature, top_p=top_p, top_k=top_k,
-                        eos_id=eos_id, pad_id=pad_id, rng=rng_local, return_logprobs=False,
-                    )
-                    actions.append(gen[0].tolist())
-                else:
-                    # Minimal fallback: no support for multi-image in quick test here
-                    actions.append([])
+                actions.append(generated[0].tolist())
             _, _, ret_local, _, _ = env_test.step_list(states, actions)
-            ret_local = np.array(ret_local)
-            ret = host_gather(shard_data_fn(ret_local))
-            if jax.process_index() == 0:
-                wandb.log({'test_env/return': float(np.mean(ret))}, commit=False)
-
-        # Optional checkpoint save (params only)
-        if step_idx % int(FLAGS.save_interval) == 0 and FLAGS.save_dir:
-            params_gather = host_gather(train_state.params)
-            if jax.process_index() == 0:
-                step_dir = FLAGS.save_dir + f"/step{step_idx}/"
-                cp = Checkpoint(step_dir + 'params.pkl', parallel=False)
-                cp.params = params_gather
-                cp.save()
+            ret = host_gather(shard_data_fn(np.asarray(ret_local, dtype=np.float32)))
+            wandb.log({"test/return": float(np.mean(ret)), "global_step": int(step_idx)}, commit=False)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(main)
