@@ -215,11 +215,20 @@ def _prepare_prompt_and_embeds(
 
 
 def _build_masks(prompt_lens: np.ndarray, action_lens: np.ndarray, seq_len: int) -> jnp.ndarray:
-    mask = np.zeros((len(prompt_lens), seq_len), dtype=np.int32)
+    # The policy gradient should only cover generated tokens.  The logits we
+    # train against come from `text_target = tokens[:, 1:]`, so we build a mask
+    # with that shape instead of the original sequence length.
+    if seq_len <= 1:
+        return jnp.zeros((len(prompt_lens), 0), dtype=jnp.int32)
+    mask = np.zeros((len(prompt_lens), seq_len - 1), dtype=np.int32)
     for i, (prompt_len, action_len) in enumerate(zip(prompt_lens, action_lens, strict=True)):
-        start = max(int(prompt_len) - 1, 0)
-        end = min(start + max(int(action_len) - 1, 0), seq_len - 1)
-        if end >= start:
+        action_len = int(action_len)
+        if action_len <= 0:
+            continue
+        prompt_len = int(prompt_len)
+        start = max(prompt_len - 1, 0)
+        end = min(start + action_len - 1, mask.shape[1] - 1)
+        if start <= end:
             mask[i, start : end + 1] = 1
     return jnp.asarray(mask)
 
@@ -344,14 +353,24 @@ def collect_rollouts(
             for key, values in infos_local.items():
                 if values is None:
                     continue
-                arr = np.asarray(values)
+                try:
+                    arr = np.asarray(values)
+                except (ValueError, TypeError):
+                    continue
                 if arr.size == 0 or arr.dtype.kind not in {"b", "i", "u", "f"}:
                     continue
-                arr = arr.astype(np.float32, copy=False)
-                gathered = host_gather(shard_data_fn(arr))
-                gathered_np = np.asarray(gathered, dtype=np.float32)
-                info_sums[key] = info_sums.get(key, 0.0) + float(gathered_np.sum())
-                info_counts[key] = info_counts.get(key, 0) + int(gathered_np.size)
+                arr = arr.astype(np.float32, copy=False).reshape(-1)
+                local_sum = float(arr.sum())
+                local_count = int(arr.size)
+                if jax.process_count() > 1:
+                    sum_device = jax.device_put(np.asarray([local_sum], dtype=np.float32))
+                    cnt_device = jax.device_put(np.asarray([local_count], dtype=np.int32))
+                    gathered_sum = np.asarray(host_gather(sum_device), dtype=np.float32)
+                    gathered_cnt = np.asarray(host_gather(cnt_device), dtype=np.int32)
+                    local_sum = float(gathered_sum.sum())
+                    local_count = int(gathered_cnt.sum())
+                info_sums[key] = info_sums.get(key, 0.0) + local_sum
+                info_counts[key] = info_counts.get(key, 0) + local_count
 
         stats["rollouts"] += float(len(returns_global))
         if len(buffer_rewards) + len(returns_global) > 0:
@@ -557,7 +576,7 @@ def main(_):
     def _update(train_state, tokens, mask, advantages, sample_logprobs, vision_embeds, token_mask, cos, sin):
         text_input = tokens[:, :-1]
         text_target = tokens[:, 1:]
-        mask_tokens = mask[:, 1:]
+        mask_tokens = mask
 
         def loss_fn(params):
             def call_with_params(p):

@@ -91,7 +91,7 @@ class OSV5MEnv(BaseEnv):
         split: str = "test",
         difficulty_schedule: Optional[Dict[int, Any]] = None,
         coord_tolerance_km: float = 25.0,  # legacy tolerance (still used for info)
-        max_samples: int = 1000,  # limit dataset size for efficiency
+        max_samples: int = float('inf'),  # no limit - load all available samples
         # Hierarchical reward weights (sum <= 1.0 recommended)
         country_weight: float = 0.2,
         region_weight: float = 0.3,
@@ -224,10 +224,8 @@ class OSV5MEnv(BaseEnv):
                 }
             )
 
-            # Stop early if we have enough samples
-            if len(parsed) >= self.max_samples:
-                print(f"Found {len(parsed)} images (reached max_samples limit)")
-                break
+            # No limit - load all available samples
+            # (removed max_samples check)
 
         if len(parsed) == 0:
             print(f"No images found after checking {checked_count} entries")
@@ -441,11 +439,15 @@ class OSV5MEnv(BaseEnv):
                 distance_km = self._haversine_distance(gt_coords[0], gt_coords[1], float(pred_lat), float(pred_lon))
                 r_geo = exp(-float(distance_km) / max(self.geo_decay_km, 1e-6))
                 info["predicted_coords"] = (float(pred_lat), float(pred_lon))
+                info["predicted_lat"] = float(pred_lat)
+                info["predicted_lon"] = float(pred_lon)
                 info["distance_km"] = float(distance_km)
                 info["coords_in_range"] = int(1)
             else:
                 info["coords_in_range"] = int(0)
         info["correct_coords"] = (state.latitude, state.longitude)
+        info["correct_lat"] = float(state.latitude)
+        info["correct_lon"] = float(state.longitude)
         # Coordinate presence/tolerance metrics
         has_coords = int(isinstance(pred_lat, (int, float)) and isinstance(pred_lon, (int, float)))
         info["has_coords"] = has_coords
