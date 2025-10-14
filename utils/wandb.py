@@ -4,6 +4,8 @@ Taken from https://github.com/kvfrans/lmpo/tree/main/utils
 """
 import wandb
 
+from typing import Any, Dict, Iterable, List
+
 import tempfile
 import absl.flags as flags
 import ml_collections
@@ -18,6 +20,37 @@ wandb_config = ml_collections.ConfigDict({
     'name': 'lmpo-run',
     'entity': FieldReference(None, field_type=str),
 })
+
+_ENV_METRIC_SUMMARIES = {
+    "env/stage_acc": "mean",
+    "env/city_correct": "mean",
+    "env/distance_km": "mean",
+    "env/within_25km": "mean",
+    "env/within_100km": "mean",
+    "env/within_500km": "mean",
+    "env/distance_p50": "mean",
+    "env/distance_p90": "mean",
+    "env/format_ok": "mean",
+    "env/parsed_field_count": "mean",
+    "env/coord_quality_score": "mean",
+    "env/final_reward": "mean",
+    "env/stage_idx": "last",
+}
+
+_TRACKED_MEAN_KEYS = {
+    "stage_acc",
+    "city_correct",
+    "distance_km",
+    "format_ok",
+    "parsed_field_count",
+    "final_reward",
+}
+
+_COORD_COMPONENT_KEYS = ["has_coords", "coords_in_range", "coords_within_tolerance"]
+_ALLOWED_ENV_KEYS = set(_TRACKED_MEAN_KEYS) | {"stage_idx"} | set(_COORD_COMPONENT_KEYS)
+_DISTANCE_THRESHOLDS = [25, 100, 500]
+_DISTANCE_PERCENTILES = [50, 90]
+
 
 def get_flag_dict():
     flag_dict = {k: getattr(flags.FLAGS, k) for k in flags.FLAGS}
@@ -88,3 +121,74 @@ def setup_wandb(hyperparam_dict, entity=None, project="jaxtransformer", group=No
     )
     wandb.config.update(wandb_config, allow_val_change=True)
     return run
+
+
+def define_env_metrics():
+    """Register env-related metrics once the W&B run is active."""
+    try:
+        wandb.define_metric("global_step")
+        wandb.define_metric("*", step_metric="global_step")
+        for metric, summary in _ENV_METRIC_SUMMARIES.items():
+            if summary:
+                wandb.define_metric(metric, summary=summary)
+            else:
+                wandb.define_metric(metric)
+    except Exception:
+        # Best-effort registration; continue if W&B is unavailable.
+        pass
+
+
+def _flatten_numeric(values: Any) -> List[float]:
+    """Collect numeric scalars from arbitrarily nested env info."""
+    result: List[float] = []
+    if isinstance(values, dict):
+        for v in values.values():
+            result.extend(_flatten_numeric(v))
+        return result
+    if isinstance(values, (list, tuple, set)):
+        for v in values:
+            result.extend(_flatten_numeric(v))
+        return result
+    if hasattr(values, "shape"):
+        arr = np.asarray(values)
+        if arr.size == 0:
+            return result
+        return arr.reshape(-1).astype(np.float32).tolist()
+    if np.isscalar(values) and not isinstance(values, str):
+        result.append(float(values))
+    return result
+
+
+def summarize_env_metrics(env_infos: Dict[str, Iterable[Any]]) -> Dict[str, float]:
+    """Aggregate env info values into scalar metrics for logging."""
+    metrics: Dict[str, float] = {}
+    numeric_arrays: Dict[str, np.ndarray] = {}
+
+    for key, raw_values in env_infos.items():
+        if key not in _ALLOWED_ENV_KEYS:
+            continue
+        flattened = _flatten_numeric(raw_values)
+        if not flattened:
+            continue
+        arr = np.asarray(flattened, dtype=np.float32)
+        numeric_arrays[key] = arr
+        if key in _TRACKED_MEAN_KEYS:
+            metrics[f"env/{key}"] = float(arr.mean())
+        elif key == "stage_idx":
+            metrics["env/stage_idx"] = float(arr[-1])
+
+    distances = numeric_arrays.get("distance_km")
+    if distances is not None and distances.size > 0:
+        for thresh in _DISTANCE_THRESHOLDS:
+            metrics[f"env/within_{thresh}km"] = float(np.mean(distances <= thresh))
+        for percentile in _DISTANCE_PERCENTILES:
+            metrics[f"env/distance_p{percentile}"] = float(np.percentile(distances, percentile))
+
+    coord_arrays = [numeric_arrays[k] for k in _COORD_COMPONENT_KEYS if k in numeric_arrays]
+    if coord_arrays:
+        weights = np.arange(1, len(coord_arrays) + 1, dtype=np.float32)
+        coord_means = np.array([arr.mean() for arr in coord_arrays], dtype=np.float32)
+        coord_score = float(np.dot(coord_means, weights) / weights.sum())
+        metrics["env/coord_quality_score"] = coord_score
+
+    return metrics

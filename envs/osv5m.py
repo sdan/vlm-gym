@@ -586,8 +586,70 @@ class OSV5MEnv(BaseEnv):
                     structure_hits.add("key_value")
                 except ValueError:
                     continue
+        inline_parsed, inline_hit = self._parse_inline_delimited_prediction(text)
+        for key, value in inline_parsed.items():
+            if key not in parsed and value is not None:
+                parsed[key] = value
+        if inline_hit:
+            structure_hits.add("inline_delimited")
 
         return parsed, structure_hits
+
+    def _parse_inline_delimited_prediction(self, text: str) -> Tuple[Dict[str, Any], bool]:
+        """Parse single-line comma-delimited predictions."""
+        if not text or ("," not in text and ";" not in text and "|" not in text):
+            return {}, False
+
+        parts: list[str] = []
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            stripped = re.sub(r"^\s*(?:[-*+\u2022]|\d+(?:[.)]))\s*", "", stripped)
+            segments = [seg.strip() for seg in re.split(r"[,\|;]", stripped) if seg.strip()]
+            if not segments:
+                continue
+            parts.extend(segments)
+
+        if len(parts) < 3:
+            return {}, False
+
+        parsed: Dict[str, Any] = {}
+        used_indices: set[int] = set()
+
+        numeric_indices: list[int] = []
+        numeric_values: Dict[int, float] = {}
+        for idx, part in enumerate(parts):
+            part_clean = re.sub(r"^[A-Za-z][A-Za-z0-9\s\-/_.]*:\s*", "", part).strip()
+            if re.fullmatch(r"-?\d+(?:[.,]\d+)?", part_clean):
+                try:
+                    numeric_values[idx] = float(part_clean.replace(",", "."))
+                    numeric_indices.append(idx)
+                except ValueError:
+                    continue
+            parts[idx] = part_clean
+
+        matched = False
+        if len(numeric_indices) >= 2:
+            lat_idx = numeric_indices[-2]
+            lon_idx = numeric_indices[-1]
+            if lat_idx == len(parts) - 2 and lon_idx == len(parts) - 1:
+                lat_val = numeric_values[lat_idx]
+                lon_val = numeric_values[lon_idx]
+                if -90 <= lat_val <= 90 and -180 <= lon_val <= 180:
+                    parsed["lat"] = float(lat_val)
+                    parsed["lon"] = float(lon_val)
+                    used_indices.update({lat_idx, lon_idx})
+                    matched = True
+
+        text_parts = [value for idx, value in enumerate(parts) if idx not in used_indices and value]
+        field_order = ["city", "region", "country"]
+        for field, value in zip(field_order, text_parts):
+            if value and field not in parsed:
+                parsed[field] = value
+                matched = True
+
+        return parsed, matched
 
     def _normalize_country(self, s: Optional[str]) -> Optional[str]:
         """Normalize country name to ISO-3166 alpha-2 code using pycountry.

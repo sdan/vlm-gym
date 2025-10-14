@@ -85,6 +85,7 @@ def preprocess_image(
 
     width, height = pil_img.size
     factor = patch_size * spatial_merge_size
+
     resized_height, resized_width = smart_resize(
         height,
         width,

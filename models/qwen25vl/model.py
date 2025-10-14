@@ -1063,6 +1063,16 @@ def create_model_from_hf(hf_dir: str) -> tuple[Qwen25VLModel, dict[str, Any]]:
                     else:
                         jax_param = jax_param[jax_key]
 
+    # Handle tied embeddings: copy embed weights to lm_head when tie_word_embeddings is True
+    if cfg.get("tie_word_embeddings", False):
+        if "embed" in param_dict and "embedding" in param_dict["embed"]:
+            # lm_head kernel should be the transpose of the embedding
+            # embedding: (vocab_size, hidden_size)
+            # lm_head kernel: (hidden_size, vocab_size)
+            embed_weight = param_dict["embed"]["embedding"]
+            param_dict.setdefault("lm_head", {})["kernel"] = embed_weight.T
+            print(f"Note: tie_word_embeddings is True, copying embed weights to lm_head (transposed)")
+
     return model, flax.core.freeze(param_dict)
 
 

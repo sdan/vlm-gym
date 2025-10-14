@@ -8,3 +8,5 @@ def define_flag_dict(config):
             flags.DEFINE_integer(k, v, f"Configuration for {k}")
         elif type(v) is float:
             flags.DEFINE_float(k, v, f"Configuration for {k}")
+        elif type(v) is bool:
+            flags.DEFINE_bool(k, v, f"Configuration for {k}")

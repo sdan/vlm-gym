@@ -10,7 +10,7 @@ mixed RoPE, etc.) is preserved so this works with existing VLM environments.
 from __future__ import annotations
 
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -68,29 +68,39 @@ config = ml_collections.ConfigDict({
     "top_p": 0.9,
     "test_env_name": "",
     "test_interval": 200,
+    "gradient_checkpointing": False,
+    "max_sequence_length": 2048,
 })
 define_flag_dict(config)
 FLAGS = flags.FLAGS
 
 
-def _pad_sequences(seqs: List[np.ndarray], pad_val: int) -> jnp.ndarray:
+def _pad_sequences(seqs: List[np.ndarray], pad_val: int, max_len: Optional[int] = None) -> jnp.ndarray:
     if not seqs:
         return jnp.zeros((0, 0), dtype=jnp.int32)
-    max_len = max(int(seq.shape[0]) for seq in seqs)
-    out = np.full((len(seqs), max_len), pad_val, dtype=np.int32)
+    actual_max = max(int(seq.shape[0]) for seq in seqs)
+    target_len = min(actual_max, max_len) if max_len else actual_max
+    out = np.full((len(seqs), target_len), pad_val, dtype=np.int32)
     for i, seq in enumerate(seqs):
         arr = np.asarray(seq, dtype=np.int32)
+        arr = arr[:target_len]
         out[i, :arr.shape[0]] = arr
     return jnp.asarray(out)
 
 
-def _pad_float_sequences(seqs: List[np.ndarray], pad_val: float = 0.0) -> jnp.ndarray:
+def _pad_float_sequences(
+    seqs: List[np.ndarray],
+    pad_val: float = 0.0,
+    max_len: Optional[int] = None,
+) -> jnp.ndarray:
     if not seqs:
         return jnp.zeros((0, 0), dtype=jnp.float32)
-    max_len = max(int(seq.shape[0]) for seq in seqs)
-    out = np.full((len(seqs), max_len), pad_val, dtype=np.float32)
+    actual_max = max(int(seq.shape[0]) for seq in seqs)
+    target_len = min(actual_max, max_len) if max_len else actual_max
+    out = np.full((len(seqs), target_len), pad_val, dtype=np.float32)
     for i, seq in enumerate(seqs):
         arr = np.asarray(seq, dtype=np.float32)
+        arr = arr[:target_len]
         out[i, :arr.shape[0]] = arr
     return jnp.asarray(out)
 
@@ -233,6 +243,7 @@ def collect_rollouts(
     temperature: float,
     top_k: int | None,
     top_p: float | None,
+    max_seq_len: Optional[int] = None,
 ) -> Tuple[jax.random.PRNGKey, int, Dict[str, jnp.ndarray], Dict[str, float]]:
     buffer_tokens: List[jnp.ndarray] = []
     buffer_logprobs: List[jnp.ndarray] = []
@@ -242,6 +253,8 @@ def collect_rollouts(
     buffer_vis_embeds: List[jnp.ndarray] = []
     buffer_grid: List[jnp.ndarray] = []
     buffer_texts: List[str] = []
+    info_sums: Dict[str, float] = {}
+    info_counts: Dict[str, int] = {}
 
     env_num_tasks = env.num_tasks if env.num_tasks != -1 else 1_000_000
     stats = {"rollouts": 0.0, "reward_mean": 0.0}
@@ -291,23 +304,54 @@ def collect_rollouts(
                 return_logprobs=True,
             )
             gen_tokens = generated[0]
-            full_tokens = jnp.concatenate([prompt_tokens[0], gen_tokens], axis=0)
-            zeros = jnp.zeros((prompt_len,), dtype=jnp.float32)
-            full_logprobs = jnp.concatenate([zeros, sample_logprobs[0]], axis=0)
+            gen_logprobs = sample_logprobs[0]
+            prompt_arr = prompt_tokens[0]
+            full_tokens = jnp.concatenate([prompt_arr, gen_tokens], axis=0)
+
+            prompt_len_effective = int(prompt_len)
+            if max_seq_len is not None:
+                max_tokens_allowed = int(max_seq_len)
+                if full_tokens.shape[0] > max_tokens_allowed:
+                    allowed_actions = max_tokens_allowed - prompt_len
+                    prompt_slice_len = max(0, min(prompt_len, max_tokens_allowed))
+                    prompt_arr = prompt_arr[:prompt_slice_len]
+                    if allowed_actions <= 0:
+                        gen_tokens = gen_tokens[:0]
+                        gen_logprobs = gen_logprobs[:0]
+                    else:
+                        gen_tokens = gen_tokens[:allowed_actions]
+                        gen_logprobs = gen_logprobs[:allowed_actions]
+                    full_tokens = jnp.concatenate([prompt_arr, gen_tokens], axis=0)
+                    prompt_len_effective = int(prompt_arr.shape[0])
+            zeros = jnp.zeros((prompt_len_effective,), dtype=jnp.float32)
+            full_logprobs = jnp.concatenate([zeros, gen_logprobs], axis=0)
 
             actions.append(gen_tokens.tolist())
             tokens_local.append(full_tokens)
             logprobs_local.append(full_logprobs)
-            prompt_lens_local.append(prompt_len)
+            prompt_lens_local.append(prompt_len_effective)
             action_lens_local.append(int(gen_tokens.shape[0]))
             embeds_local.append(embeds)
             grid_local.append(grid)
             decoded = tokenizer.decode(gen_tokens.tolist(), skip_special_tokens=True)
             responses_local.append(decoded)
 
-        _, _, returns_local, _, _ = env.step_list(states, actions)
+        _, _, returns_local, _, infos_local = env.step_list(states, actions)
         returns_np = np.asarray(returns_local, dtype=np.float32)
         returns_global = host_gather(shard_data_fn(returns_np))
+
+        if infos_local:
+            for key, values in infos_local.items():
+                if values is None:
+                    continue
+                arr = np.asarray(values)
+                if arr.size == 0 or arr.dtype.kind not in {"b", "i", "u", "f"}:
+                    continue
+                arr = arr.astype(np.float32, copy=False)
+                gathered = host_gather(shard_data_fn(arr))
+                gathered_np = np.asarray(gathered, dtype=np.float32)
+                info_sums[key] = info_sums.get(key, 0.0) + float(gathered_np.sum())
+                info_counts[key] = info_counts.get(key, 0) + int(gathered_np.size)
 
         stats["rollouts"] += float(len(returns_global))
         if len(buffer_rewards) + len(returns_global) > 0:
@@ -336,8 +380,8 @@ def collect_rollouts(
             buffer_grid.append(grid)
             buffer_texts.append(text)
 
-    tokens = _pad_sequences(buffer_tokens, pad_id)
-    sample_logprobs = _pad_float_sequences(buffer_logprobs)
+    tokens = _pad_sequences(buffer_tokens, pad_id, max_seq_len)
+    sample_logprobs = _pad_float_sequences(buffer_logprobs, max_len=max_seq_len)
     prompt_lens_arr = np.asarray(buffer_prompt_lens, dtype=np.int32)
     action_lens_arr = np.asarray(buffer_action_lens, dtype=np.int32)
     mask = _build_masks(prompt_lens_arr, action_lens_arr, int(tokens.shape[1]))
@@ -359,7 +403,74 @@ def collect_rollouts(
         "responses": buffer_texts,
     }
 
+    if info_counts:
+        env_metrics = {}
+        for key, total in info_sums.items():
+            count = info_counts.get(key, 0)
+            if count > 0:
+                env_metrics[key] = float(total / count)
+        if env_metrics:
+            stats["env_metrics"] = env_metrics
+
     return rng, env_task_idx, batch, stats
+
+
+def compute_rope_indices_chunked(
+    model: Qwen25VLModel,
+    text_input: jnp.ndarray,
+    grid: jnp.ndarray,
+    token_mask: jnp.ndarray,
+    max_chunk_size: int = 4,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    batch_size = int(text_input.shape[0])
+    if batch_size > max_chunk_size:
+        cos_chunks = []
+        sin_chunks = []
+        for start in range(0, batch_size, max_chunk_size):
+            end = min(start + max_chunk_size, batch_size)
+            chunk_input = text_input[start:end]
+            chunk_grid = grid[start:end]
+            chunk_mask = token_mask[start:end]
+            pos3_chunk, _ = get_rope_index(
+                spatial_merge_size=model.spec.vision.spatial_merge_size,
+                input_ids=chunk_input,
+                image_grid_thw=chunk_grid,
+                video_grid_thw=None,
+                second_per_grid_ts=None,
+                attention_mask=chunk_mask,
+                tokens_per_second=float(model.spec.vision.tokens_per_second),
+            )
+            cos_chunk, sin_chunk = build_mrope(
+                pos3_chunk,
+                tuple(model.spec.text.rope_section),
+                float(model.spec.text.rope_theta),
+                dtype=model.dtype,
+                rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
+                rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
+            )
+            cos_chunks.append(cos_chunk)
+            sin_chunks.append(sin_chunk)
+        cos = jnp.concatenate(cos_chunks, axis=1)
+        sin = jnp.concatenate(sin_chunks, axis=1)
+    else:
+        pos3, _ = get_rope_index(
+            spatial_merge_size=model.spec.vision.spatial_merge_size,
+            input_ids=text_input,
+            image_grid_thw=grid,
+            video_grid_thw=None,
+            second_per_grid_ts=None,
+            attention_mask=token_mask,
+            tokens_per_second=float(model.spec.vision.tokens_per_second),
+        )
+        cos, sin = build_mrope(
+            pos3,
+            tuple(model.spec.text.rope_section),
+            float(model.spec.text.rope_theta),
+            dtype=model.dtype,
+            rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
+            rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
+        )
+    return cos, sin
 
 
 def main(_):
@@ -434,6 +545,10 @@ def main(_):
     top_p = top_p if (0.0 < top_p < 1.0) else None
     temperature = float(getattr(FLAGS, "temperature", 1.0) or 1.0)
 
+    max_seq_len = int(getattr(FLAGS, "max_sequence_length", 0) or 0)
+    if max_seq_len <= 0:
+        max_seq_len = None
+
     rollout_batch_size = jax.local_device_count() * int(FLAGS.inference_batch_per_device)
     rng_global = jax.random.PRNGKey(jax.process_index())
     env_task_idx = 0
@@ -445,17 +560,23 @@ def main(_):
         mask_tokens = mask[:, 1:]
 
         def loss_fn(params):
-            logits, _ = train_state.call_model(
-                text_input,
-                vision_embeds,
-                image_pad_id,
-                cos,
-                sin,
-                mask=token_mask,
-                cache=None,
-                params=params,
-                method=model.forward_vlm,
-            )
+            def call_with_params(p):
+                return train_state.call_model(
+                    text_input,
+                    vision_embeds,
+                    image_pad_id,
+                    cos,
+                    sin,
+                    mask=token_mask,
+                    cache=None,
+                    params=p,
+                    method=model.forward_vlm,
+                )
+
+            if getattr(FLAGS, 'gradient_checkpointing', False):
+                logits, _ = jax.checkpoint(call_with_params, prevent_cse=False)(params)
+            else:
+                logits, _ = call_with_params(params)
             logprobs = jax.nn.log_softmax(logits, axis=-1)
             token_logprobs = jnp.sum(
                 logprobs * jax.nn.one_hot(text_target, logits.shape[-1]),
@@ -524,26 +645,13 @@ def main(_):
             temperature,
             top_k,
             top_p,
+            max_seq_len=max_seq_len,
         )
 
         text_input = batch["tokens"][:, :-1]
         token_mask = (text_input != pad_id).astype(jnp.int32)
-        pos3, _ = get_rope_index(
-            spatial_merge_size=model.spec.vision.spatial_merge_size,
-            input_ids=text_input,
-            image_grid_thw=batch["grid"],
-            video_grid_thw=None,
-            second_per_grid_ts=None,
-            attention_mask=token_mask,
-            tokens_per_second=float(model.spec.vision.tokens_per_second),
-        )
-        cos, sin = build_mrope(
-            pos3,
-            tuple(model.spec.text.rope_section),
-            float(model.spec.text.rope_theta),
-            dtype=model.dtype,
-            rope_scaling_type=getattr(model.spec.text, "rope_scaling_type", None),
-            rope_scaling_factor=getattr(model.spec.text, "rope_scaling_factor", None),
+        cos, sin = compute_rope_indices_chunked(
+            model, text_input, batch["grid"], token_mask
         )
 
         train_state, metrics = _update(
@@ -566,6 +674,9 @@ def main(_):
             "rollouts_per_step": rollout_stats["rollouts"],
         }
         info.update({f"train/{k}": float(v) for k, v in metrics.items()})
+        env_metrics = rollout_stats.get("env_metrics", {})
+        for k, v in env_metrics.items():
+            info[k] = float(v)
 
         if jax.process_index() == 0:
             sample_reward = float(batch["rewards"][0]) if batch["rewards"].size > 0 else float("nan")
@@ -577,6 +688,9 @@ def main(_):
             )
             if sample_text:
                 print(f"[step {step_idx}] sample response: {preview}")
+            if env_metrics:
+                formatted_env = ", ".join(f"{key}={value:.3f}" for key, value in env_metrics.items())
+                print(f"[step {step_idx}] env metrics: {formatted_env}")
             wandb.log(info, commit=True)
 
         if step_idx % int(FLAGS.save_interval) == 0 and FLAGS.save_dir and jax.process_index() == 0:
