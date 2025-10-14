@@ -69,7 +69,7 @@ config = ml_collections.ConfigDict({
     'do_group_filter': 1,
     'do_clip_advantages': 0,
     # importance sampling choices
-    'do_inference_logprobs': 0,
+    'do_inference_logprobs': 1,
     'do_mask_importance_ratio': 0,
     'do_ppo_all_clip': 0,
     # image preprocessing bounds
@@ -272,6 +272,9 @@ def main(_):
     for step_idx in tqdm.tqdm(range(int(FLAGS.total_steps))):
         if step_idx == 0 and jax.process_index() == 0:
             print("[WANDB DEBUG] Starting training loop, first step...")
+        # Ensure the sampler uses the latest parameters for generation
+        # to avoid mismatch with vision embeddings computed from updated params.
+        vlm_sampler.params = train_state.params
         # On-policy buffer
         buffer_tokens: list[jnp.ndarray] = []
         buffer_adv: list[jnp.ndarray] = []
@@ -884,6 +887,11 @@ def main(_):
             info['training/learning_rate'] = lr
         except Exception:
             info['training/learning_rate'] = float(FLAGS.lr)
+        # Debug: print keys in env_infos_history
+        if jax.process_index() == 0 and step_idx == 0:
+            print(f"[WANDB DEBUG] env_infos_history keys: {list(env_infos_history.keys())}")
+            print(f"[WANDB DEBUG] Sample counts: {[(k, len(v) if isinstance(v, (list, tuple)) else 1) for k, v in list(env_infos_history.items())[:5]]}")
+
         for k, v in env_infos_history.items():
             if isinstance(v, (list, tuple)):
                 vals = v
@@ -894,8 +902,107 @@ def main(_):
                 vals_np = np.array(vals)
                 if vals_np.dtype.kind in {'i', 'u', 'f'}:
                     info[f'env/{k}'] = float(np.mean(vals_np))
-            except Exception:
-                pass
+                    if jax.process_index() == 0 and step_idx == 0:
+                        print(f"[WANDB DEBUG] Logged metric: env/{k} = {float(np.mean(vals_np)):.4f}")
+                elif jax.process_index() == 0 and step_idx == 0:
+                    print(f"[WANDB DEBUG] Skipped metric '{k}': dtype.kind={vals_np.dtype.kind} (not numeric)")
+            except Exception as e:
+                if jax.process_index() == 0 and step_idx == 0:
+                    print(f"[WANDB DEBUG] Failed to process metric '{k}': {type(e).__name__}: {e}")
+
+        # ============= ENHANCED HOLISTIC METRICS =============
+        # Calculate additional metrics for better tracking of model improvements
+        
+        # Distance threshold metrics - track pass rates at various tolerances
+        if 'distance_km' in env_infos_history:
+            distances = np.array(env_infos_history['distance_km'])
+            if len(distances) > 0:
+                # Calculate pass rates for common distance thresholds
+                info['env/within_10km'] = float(np.mean(distances <= 10))
+                info['env/within_25km'] = float(np.mean(distances <= 25))
+                info['env/within_50km'] = float(np.mean(distances <= 50))
+                info['env/within_100km'] = float(np.mean(distances <= 100))
+                info['env/within_250km'] = float(np.mean(distances <= 250))
+                info['env/within_500km'] = float(np.mean(distances <= 500))
+                info['env/within_1000km'] = float(np.mean(distances <= 1000))
+                
+                # Distance percentiles for better understanding of distribution
+                info['env/distance_p25'] = float(np.percentile(distances, 25))
+                info['env/distance_p50'] = float(np.percentile(distances, 50))  # median
+                info['env/distance_p75'] = float(np.percentile(distances, 75))
+                info['env/distance_p90'] = float(np.percentile(distances, 90))
+        
+        # Format success rate - aggregate multiple format indicators
+        format_indicators = []
+        for key in ['format_ok', 'has_country', 'has_region', 'has_city', 'country_valid']:
+            if key in env_infos_history:
+                format_indicators.append(np.array(env_infos_history[key]))
+        
+        if format_indicators:
+            # Overall format health score (average of all format indicators)
+            format_health = np.mean([np.mean(ind) for ind in format_indicators])
+            info['env/format_health_score'] = float(format_health)
+        
+        # Hierarchical accuracy progression - track improvement ratios
+        hier_keys = ['country_correct', 'region_correct', 'city_correct']
+        hier_values = []
+        for key in hier_keys:
+            if key in env_infos_history:
+                vals = np.array(env_infos_history[key])
+                if len(vals) > 0:
+                    hier_values.append(float(np.mean(vals)))
+        
+        if hier_values:
+            # Calculate hierarchical progression score
+            # Weighted by difficulty: country=1, region=2, city=3
+            weights = [1.0, 2.0, 3.0][:len(hier_values)]
+            hier_score = sum(v * w for v, w in zip(hier_values, weights)) / sum(weights)
+            info['env/hierarchical_score'] = float(hier_score)
+        
+        # Success rate metrics - track different success criteria
+        if 'stage_acc' in env_infos_history:
+            stage_accs = np.array(env_infos_history['stage_acc'])
+            if len(stage_accs) > 0:
+                # Success rate (percentage of fully correct predictions)
+                info['env/success_rate'] = float(np.mean(stage_accs))
+                # High confidence predictions (rewards > 0.5)
+                if 'return' in env_infos_history:
+                    rewards = np.array(env_infos_history['return'])
+                    info['env/high_confidence_rate'] = float(np.mean(rewards > 0.5))
+        
+        # Coordinate prediction quality score
+        coord_quality_indicators = []
+        for key in ['has_coords', 'coords_in_range', 'coords_within_tolerance']:
+            if key in env_infos_history:
+                coord_quality_indicators.append(np.array(env_infos_history[key]))
+        
+        if coord_quality_indicators:
+            # Coordinate quality score (weighted average)
+            # has_coords=1, in_range=2, within_tolerance=3
+            weights = [1.0, 2.0, 3.0][:len(coord_quality_indicators)]
+            coord_scores = [float(np.mean(ind)) for ind in coord_quality_indicators]
+            coord_quality = sum(s * w for s, w in zip(coord_scores, weights)) / sum(weights)
+            info['env/coord_quality_score'] = float(coord_quality)
+        
+        # Overall improvement score - combines multiple metrics
+        improvement_components = []
+        if 'env/success_rate' in info:
+            improvement_components.append(info['env/success_rate'])
+        if 'env/format_health_score' in info:
+            improvement_components.append(info['env/format_health_score'])
+        if 'env/hierarchical_score' in info:
+            improvement_components.append(info['env/hierarchical_score'])
+        if 'env/coord_quality_score' in info:
+            improvement_components.append(info['env/coord_quality_score'])
+        
+        if improvement_components:
+            info['env/overall_improvement_score'] = float(np.mean(improvement_components))
+        
+        # Track improvement rate if we have historical data
+        # (This would need a persistent history across steps - simplified version here)
+        if step_idx > 0 and 'env/overall_improvement_score' in info:
+            # Log the current score for tracking trends
+            info['env/improvement_trend'] = info['env/overall_improvement_score']
 
         # Enhanced response logging with W&B tables
         if jax.process_index() == 0:
