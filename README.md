@@ -1,15 +1,32 @@
 <img width="1027" height="566" alt="Screenshot 2025-10-09 at 12 10 39 PM" src="https://github.com/user-attachments/assets/43d593ed-3426-4532-8462-f3108dcf4f33" />
 
-# vlmrl
+# vlm-gym
 
-A reinforcement learning framework for vision-language models, written in JAX.
+A modular reinforcement learning framework for vision-language models, written in JAX. Drop in any environment, any model, and train with GRPO.
 
 **Core components:**
-- `models/qwen25vl` — Qwen2.5-VL with mRoPE, KV cache, grouped-query attention
-- `core/sampling.py` — Inference
-- `core/grpo.py` — Training (GRPO)
-- `core/eval.py` — Evaluation
-- `envs/base.py` — Vision environments for captioning, multimodal reasoning, etc.
+- `envs/` — Pluggable vision environments (GeoGuessr, NLVR2, captioning)
+- `models/` — VLM implementations (Qwen2.5-VL reference)
+- `core/grpo.py` — GRPO trainer (works with any VLM)
+- `core/sampling.py` — Inference engine
+- `core/eval.py` — Evaluation harness
+
+---
+
+## Example: Training a VLM to play GeoGuessr
+
+With vlm-gym, you can train a 7B VLM to predict locations from street-view images. The model learns through a curriculum: first countries, then regions, then cities, using distance-based reward shaping.
+
+```bash
+# Train on OpenStreetView-5M dataset
+python core/grpo.py \
+  --model_dir=checkpoints/qwen25vl_7b \
+  --env_name=osv5m \
+  --lr=5e-7 \
+  --total_steps=10000
+```
+
+Results: Random baseline → 60%+ country accuracy in just a few thousand steps!
 
 ---
 
@@ -33,23 +50,24 @@ python -m core.sampling \
   --prompt "Describe the image"
 ```
 
-**Train (GRPO)**
+**Train with GRPO**
 ```bash
+# Train on any environment
 python core/grpo.py \
   --model_dir=checkpoints/qwen25vl_7b \
-  --env_name=vision \
+  --env_name=osv5m  # or: vision, nlvr2, your_custom_env \
   --groups_per_batch=8 \
   --group_size=1 \
   --lr=5e-7 \
   --total_steps=10000 \
-  --wandb_project=vlm-rl
+  --wandb_project=vlm-gym
 ```
 
-**Eval**
+**Evaluate**
 ```bash
 python core/eval.py \
   --model_dir checkpoints/qwen25vl_7b \
-  --env_name=vision \
+  --env_name=osv5m  # Match your training env \
   --num_generation_tokens=128 \
   --inference_batch_per_device=1 \
   --vlm_max_pixels=1048576 \
@@ -60,10 +78,22 @@ python core/eval.py \
 
 ## Environments
 
-Extend `envs.base.BaseEnv` to add custom vision environments.
+Creating a custom environment is simple - just extend `envs.base.BaseEnv`:
 
-**Built-in:**
-- `vision` / `vision_caption` — Single-image captioning; reward = keyword hits
+```python
+class MyEnv(BaseEnv):
+    def reset(self, idx):
+        # Return state and observation
+        return state, obs
+    
+    def step(self, state, action_tokens):
+        # Calculate reward based on VLM output
+        return state, [], reward, done, info
+```
+
+**Built-in environments:**
+- `osv5m` — **GeoGuessr**: Street-view geolocation with hierarchical rewards (country→region→city→coords)
+- `vision` / `vision_caption` — Image captioning with keyword-based rewards
 - `nlvr2` — Two-image True/False reasoning
 
 ---
