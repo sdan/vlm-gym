@@ -1,3 +1,5 @@
+<img width="225" height="160" alt="vlmgym" src="https://github.com/user-attachments/assets/87d7d141-4464-4687-91c0-3a6da82b2749" />
+
 # vlm-gym
 
 A simple reinforcement learning framework for vision-language models, written in JAX. Drop in any environment, any model, and train with GRPO.
@@ -5,15 +7,15 @@ A simple reinforcement learning framework for vision-language models, written in
 **Core components:**
 - `envs/` — Pluggable vision environments (GeoGuessr, NLVR2, captioning)
 - `models/` — VLM implementations (Qwen2.5-VL reference)
-- `core/grpo.py` — GRPO trainer (works with any VLM)
+- `core/grpo.py` — Trainer (currently just a modified version of REINFORCE)
 - `core/sampling.py` — Inference engine
 - `core/eval.py` — Evaluation harness
 
 ---
 
-## Example: Training a VLM to play GeoGuessr
+## train a VLM to play GeoGuessr
 
-With vlm-gym, you can train a 7B VLM to predict locations from street-view images. The model learns through a curriculum: first countries, then regions, then cities, using distance-based reward shaping.
+the reward is shaped to get countries, then regions, then cities, and finally distance-based correct
 
 ```bash
 # Train on OpenStreetView-5M dataset
@@ -23,12 +25,7 @@ python core/grpo.py \
   --lr=5e-7 \
   --total_steps=10000
 ```
-
-Results: Random baseline → 60%+ country accuracy in just a few thousand steps!
-
 ---
-
-## Quickstart
 
 **Install**
 ```bash
@@ -48,7 +45,7 @@ python -m core.sampling \
   --prompt "Describe the image"
 ```
 
-**Train with GRPO**
+**Train**
 ```bash
 # Train on any environment
 python core/grpo.py \
@@ -91,7 +88,6 @@ class MyEnv(BaseEnv):
 
 **Built-in environments:**
 - `osv5m` — **GeoGuessr**: Street-view geolocation with hierarchical rewards (country→region→city→coords)
-- `vision` / `vision_caption` — Image captioning with keyword-based rewards
 - `nlvr2` — Two-image True/False reasoning
 
 ---
