@@ -1,11 +1,7 @@
-"""Qwen2.5-VL JAX model components.
+"""Qwen3-VL JAX model components
 
-Feature map:
-- Generalized multi-head attention with GQA (num_heads vs num_kv_heads) and KV cache support.
-- Multimodal RoPE via mRoPE builders and get_rope_index.
-- Vision tower isolation plus image-pad embedding injection (see vision.py).
+https://github.com/huggingface/transformers/blob/caa14e7dabb086f167c14b7eecadc2ba9db25eb6/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py
 """
-
 from __future__ import annotations
 
 import glob
@@ -18,10 +14,63 @@ import flax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from flax import struct
 from safetensors import safe_open
 
 
 DType = jnp.dtype
+
+
+@struct.dataclass
+class VisionEmbeddings:
+    tokens: jax.Array
+    deepstack: tuple[jax.Array, ...] = ()
+
+    @classmethod
+    def concatenate(cls, embeds: Sequence["VisionEmbeddings"]) -> "VisionEmbeddings":
+        if not embeds:
+            return cls(tokens=jnp.zeros((0, 0), dtype=jnp.float32), deepstack=())
+        base_deepstack_len = len(embeds[0].deepstack)
+        tokens = jnp.concatenate([jnp.asarray(e.tokens) for e in embeds], axis=0)
+        for emb in embeds[1:]:
+            if len(emb.deepstack) != base_deepstack_len:
+                raise ValueError("All VisionEmbeddings must have the same number of DeepStack levels to concatenate.")
+        deepstack = tuple(
+            jnp.concatenate([jnp.asarray(e.deepstack[idx]) for e in embeds], axis=0)
+            for idx in range(base_deepstack_len)
+        )
+        return cls(tokens=tokens, deepstack=deepstack)
+
+    def cast(self, dtype: DType) -> "VisionEmbeddings":
+        tokens = jnp.asarray(self.tokens, dtype=dtype)
+        deepstack = tuple(jnp.asarray(feat, dtype=dtype) for feat in self.deepstack)
+        return VisionEmbeddings(tokens=tokens, deepstack=deepstack)
+
+    def with_batch_dim(self, batch: int) -> "VisionEmbeddings":
+        """Ensure tokens/deepstack include batch dimension of size `batch` or 1."""
+        tokens = self.tokens
+        if tokens.ndim == 2:
+            tokens = tokens[None, ...]
+        if tokens.shape[0] not in (1, batch):
+            raise ValueError(
+                f"Vision tokens batch dimension must be 1 or match input batch; got {tokens.shape[0]}, expected {batch}."
+            )
+        if tokens.shape[0] == 1 and batch > 1:
+            tokens = jnp.tile(tokens, (batch, 1, 1))
+
+        deepstack = []
+        for feat in self.deepstack:
+            if feat.ndim == 2:
+                feat = feat[None, ...]
+            if feat.shape[0] not in (1, batch):
+                raise ValueError(
+                    f"DeepStack batch dimension must be 1 or match input batch; got {feat.shape[0]}, expected {batch}."
+                )
+            if feat.shape[0] == 1 and batch > 1:
+                feat = jnp.tile(feat, (batch, 1, 1))
+            deepstack.append(feat)
+
+        return VisionEmbeddings(tokens=tokens, deepstack=tuple(deepstack))
 
 
 def rms_norm(x: jax.Array, gamma: jax.Array, eps: float) -> jax.Array:
@@ -49,6 +98,8 @@ def apply_multimodal_rotary_pos_emb(
 
     Expects pre-built cos/sin tensors matching the head_dim layout (either via
     ``build_text_rope`` for 1D text or ``build_mrope`` for multimodal tokens).
+
+    Supports interleaved mRoPE where only part of head_dim is rotated.
     """
     sections = tuple(int(x) for x in rope_section)
     if len(sections) == 0:
@@ -81,8 +132,28 @@ def apply_multimodal_rotary_pos_emb(
     sin_flat = _reorder(sin).astype(q.dtype)
     cos_embed = jnp.expand_dims(cos_flat, axis=unsqueeze_dim)
     sin_embed = jnp.expand_dims(sin_flat, axis=unsqueeze_dim)
-    q_embed = q * cos_embed + rotate_half(q) * sin_embed
-    k_embed = k * cos_embed + rotate_half(k) * sin_embed
+
+    # Handle interleaved mRoPE: only rotate part of head_dim
+    rope_dim = total_dim * 2
+    head_dim = q.shape[-1]
+    if rope_dim > head_dim:
+        # Interleaved: cos/sin are for more dims than head, rotate only first total_dim of head
+        rotated_dim = total_dim
+        q_rot = q[..., :rotated_dim]
+        q_pass = q[..., rotated_dim:]
+        k_rot = k[..., :rotated_dim]
+        k_pass = k[..., rotated_dim:]
+        # Take only the dimensions needed for the rotated part
+        cos_rot = cos_embed[..., :rotated_dim]
+        sin_rot = sin_embed[..., :rotated_dim]
+        q_rot_embed = q_rot * cos_rot + rotate_half(q_rot) * sin_rot
+        k_rot_embed = k_rot * cos_rot + rotate_half(k_rot) * sin_rot
+        q_embed = jnp.concatenate([q_rot_embed, q_pass], axis=-1)
+        k_embed = jnp.concatenate([k_rot_embed, k_pass], axis=-1)
+    else:
+        # Standard: rotate full head_dim
+        q_embed = q * cos_embed + rotate_half(q) * sin_embed
+        k_embed = k * cos_embed + rotate_half(k) * sin_embed
     return q_embed, k_embed
 
 
@@ -160,38 +231,29 @@ def get_rope_index(
     spatial_merge_size: int = 2,
     input_ids: Optional[jax.Array] = None,
     image_grid_thw: Optional[jax.Array] = None,
-    video_grid_thw: Optional[jax.Array] = None,
-    second_per_grid_ts: Optional[jax.Array] = None,
     attention_mask: Optional[jax.Array] = None,
-    *,
-    tokens_per_second: float = 1.0,
 ) -> Tuple[jax.Array, jax.Array]:
-    """Reproduce Qwen2.5-VL multimodal RoPE indexing logic in JAX.
-
-    # linearize text + vision blocks
-    """
+    """Compute multimodal RoPE indices for text + image inputs (video unsupported)."""
 
     image_token_id = 151655
-    video_token_id = 151656
     vision_start_token_id = 151652
+
     if input_ids is not None:
         batch, seq_len = input_ids.shape
     else:
         batch = attention_mask.shape[0] if attention_mask is not None else 1
         seq_len = attention_mask.shape[1] if attention_mask is not None else 1
 
-    if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+    if input_ids is not None and image_grid_thw is not None:
         total_input_ids = input_ids
         if attention_mask is None:
             attention_mask = jnp.ones_like(total_input_ids)
 
         position_ids = jnp.ones((3, batch, seq_len), dtype=total_input_ids.dtype)
         mrope_position_deltas: list[jax.Array] = []
-        # Support either flat per-batch lists (N,3) or batched (B, N_i, 3)
         image_index_global = 0
-        video_index_global = 0
 
-        for i in range(batch):  # per-example pass
+        for i in range(batch):
             ids = total_input_ids[i]
             mask = attention_mask[i]
             valid = ids[mask == 1]
@@ -202,74 +264,29 @@ def get_rope_index(
                 else jnp.array([], dtype=valid.dtype)
             )
             image_nums = int((vision_tokens == image_token_id).sum())
-            video_nums = int((vision_tokens == video_token_id).sum())
             input_tokens = valid.tolist()
 
             llm_pos_ids_list: list[jax.Array] = []
             st = 0
-            remain_images = image_nums
-            remain_videos = video_nums
             image_index_local = 0
-            video_index_local = 0
 
-            for _ in range(image_nums + video_nums):  # walk chunks in order
-                if remain_images > 0:
-                    try:
-                        ed_image = input_tokens.index(image_token_id, st)
-                    except ValueError:
-                        ed_image = len(input_tokens) + 1
-                else:
+            for _ in range(image_nums):
+                try:
+                    ed_image = input_tokens.index(image_token_id, st)
+                except ValueError:
                     ed_image = len(input_tokens) + 1
-                if remain_videos > 0:
-                    try:
-                        ed_video = input_tokens.index(video_token_id, st)
-                    except ValueError:
-                        ed_video = len(input_tokens) + 1
-                else:
-                    ed_video = len(input_tokens) + 1
 
-                use_image = ed_image < ed_video
-                if use_image:
-                    if image_grid_thw is None:
-                        raise ValueError(
-                            "image_grid_thw must be provided when image tokens are present"
-                        )
-                    # Select the proper grid entry depending on input layout
-                    if hasattr(image_grid_thw, 'ndim') and int(image_grid_thw.ndim) == 3:
-                        t, h, w = [int(x) for x in image_grid_thw[i, image_index_local]]
-                        image_index_local += 1
-                    else:
-                        t, h, w = [int(x) for x in image_grid_thw[image_index_global]]
-                        image_index_global += 1
-                    second_per_grid_t = 0.0
-                    remain_images -= 1
-                    ed = ed_image
+                if hasattr(image_grid_thw, "ndim") and int(image_grid_thw.ndim) == 3:
+                    t, h, w = [int(x) for x in image_grid_thw[i, image_index_local]]
+                    image_index_local += 1
                 else:
-                    if video_grid_thw is None:
-                        raise ValueError(
-                            "video_grid_thw must be provided when video tokens are present"
-                        )
-                    if hasattr(video_grid_thw, 'ndim') and int(video_grid_thw.ndim) == 3:
-                        t, h, w = [int(x) for x in video_grid_thw[i, video_index_local]]
-                        video_index_local += 1
-                    else:
-                        t, h, w = [int(x) for x in video_grid_thw[video_index_global]]
-                        video_index_global += 1
-                    if second_per_grid_ts is not None:
-                        if hasattr(video_grid_thw, 'ndim') and int(video_grid_thw.ndim) == 3:
-                            idx = video_index_local - 1  # already incremented above
-                        else:
-                            idx = video_index_global - 1
-                        second_per_grid_t = float(second_per_grid_ts[idx])
-                    else:
-                        second_per_grid_t = 1.0
-                    remain_videos -= 1
-                    ed = ed_video
+                    t, h, w = [int(x) for x in image_grid_thw[image_index_global]]
+                    image_index_global += 1
 
                 llm_grid_t = t
                 llm_grid_h = h // spatial_merge_size
                 llm_grid_w = w // spatial_merge_size
-                text_len = ed - st
+                text_len = ed_image - st
 
                 if llm_pos_ids_list:
                     st_idx = int(jnp.max(llm_pos_ids_list[-1])) + 1
@@ -280,35 +297,32 @@ def get_rope_index(
                 text_positions = jnp.tile(text_range.reshape(1, -1), (3, 1)) + st_idx
                 llm_pos_ids_list.append(text_positions)
 
-                range_tensor = jnp.arange(llm_grid_t, dtype=jnp.int32).reshape(-1, 1)  # time index
+                range_tensor = jnp.arange(llm_grid_t, dtype=jnp.int32).reshape(-1, 1)
                 expanded_range = jnp.tile(range_tensor, (1, llm_grid_h * llm_grid_w))
-                time_tensor = (
-                    expanded_range.astype(jnp.float32)
-                    * float(second_per_grid_t)
-                    * float(tokens_per_second)
-                )
-                t_index = time_tensor.astype(jnp.int32).reshape(-1)
+                t_index = expanded_range.reshape(-1)
 
-                h_index = jnp.arange(llm_grid_h, dtype=jnp.int32).reshape(1, -1, 1)  # h index
+                h_index = jnp.arange(llm_grid_h, dtype=jnp.int32).reshape(1, -1, 1)
                 h_index = jnp.tile(h_index, (llm_grid_t, 1, llm_grid_w)).reshape(-1)
-                w_index = jnp.arange(llm_grid_w, dtype=jnp.int32).reshape(1, 1, -1)  # w index
+                w_index = jnp.arange(llm_grid_w, dtype=jnp.int32).reshape(1, 1, -1)
                 w_index = jnp.tile(w_index, (llm_grid_t, llm_grid_h, 1)).reshape(-1)
                 spatial = jnp.stack([t_index, h_index, w_index], axis=0)
                 spatial = spatial + text_len + st_idx
                 llm_pos_ids_list.append(spatial)
-                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+                st = ed_image + llm_grid_t * llm_grid_h * llm_grid_w
 
             if st < len(input_tokens):
-                if llm_pos_ids_list:
-                    st_idx = int(jnp.max(llm_pos_ids_list[-1])) + 1
-                else:
-                    st_idx = 0
+                st_idx = int(jnp.max(llm_pos_ids_list[-1])) + 1 if llm_pos_ids_list else 0
                 text_len = len(input_tokens) - st
                 text_range = jnp.arange(text_len, dtype=valid.dtype)
                 text_positions = jnp.tile(text_range.reshape(1, -1), (3, 1)) + st_idx
                 llm_pos_ids_list.append(text_positions)
 
-            llm_positions = jnp.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
+            if llm_pos_ids_list:
+                llm_positions = jnp.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
+            else:
+                text_range = jnp.arange(valid.shape[0], dtype=valid.dtype)
+                llm_positions = jnp.tile(text_range.reshape(1, -1), (3, 1))
+
             sel = jnp.where(mask == 1)[0]
             position_ids = position_ids.at[:, i, sel].set(llm_positions)
             delta = jnp.array(int(jnp.max(llm_positions)) + 1 - seq_len, dtype=valid.dtype)
@@ -377,6 +391,7 @@ class TextBackboneSpec:
     rope_section: Sequence[int]
     rope_scaling_type: Optional[str]
     rope_scaling_factor: Optional[float]
+    mrope_interleaved: bool
     rms_norm_eps: float
     vocab_size: int
 
@@ -393,12 +408,13 @@ class VisionBackboneSpec:
     spatial_merge_size: int
     window_size: int
     in_channels: int
-    tokens_per_second: int
     fullatt_block_indexes: Sequence[int]
+    num_position_embeddings: Optional[int] = None
+    deepstack_visual_indexes: Sequence[int] = ()
 
 
 @dataclass
-class Qwen25VLSpec:
+class Qwen3VLSpec:
     text: TextBackboneSpec
     vision: Optional[VisionBackboneSpec]
     pad_token_id: Optional[int]
@@ -443,6 +459,7 @@ class MultiHeadAttention(nn.Module):
     num_kv_heads: int
     head_dim: int
     rope_section: Optional[Sequence[int]] = None
+    eps: float = 1e-6
     dtype: DType = jnp.bfloat16
 
     @nn.compact
@@ -470,6 +487,9 @@ class MultiHeadAttention(nn.Module):
         q = q.reshape(batch, seqlen, self.num_heads, self.head_dim)
         k = k.reshape(batch, seqlen, self.num_kv_heads, self.head_dim)
         v = v.reshape(batch, seqlen, self.num_kv_heads, self.head_dim)
+
+        q = RMSNorm(self.head_dim, self.eps, self.dtype, name="q_norm")(q)
+        k = RMSNorm(self.head_dim, self.eps, self.dtype, name="k_norm")(k)
 
         q = jnp.transpose(q, (0, 2, 1, 3))
         k = jnp.transpose(k, (0, 2, 1, 3))
@@ -577,6 +597,7 @@ class DecoderBlock(nn.Module):
             self.num_kv_heads,
             self.head_dim,
             rope_section=self.rope_section,
+            eps=self.eps,
             dtype=self.dtype,
         )
         self.mlp = FeedForward(
@@ -666,8 +687,8 @@ class KVCache(flax.struct.PyTreeNode):
         return new_layer_keys, new_layer_values, cache
 
 
-class Qwen25VLModel(nn.Module):
-    spec: Qwen25VLSpec
+class Qwen3VLModel(nn.Module):
+    spec: Qwen3VLSpec
     dtype: DType = jnp.bfloat16
 
     def setup(self) -> None:
@@ -691,11 +712,33 @@ class Qwen25VLModel(nn.Module):
         self.final_norm = RMSNorm(text.hidden_size, text.rms_norm_eps, self.dtype)
         self.lm_head = nn.Dense(text.vocab_size, use_bias=False, dtype=jnp.float32)  # logits in fp32
         if self.spec.vision is not None:
-            from .vision import Qwen25VisionTransformer
+            from .vision import Qwen3VisionTransformer
 
-            self.visual = Qwen25VisionTransformer(self.spec.vision)  # optional vision tower
+            self.visual = Qwen3VisionTransformer(self.spec.vision)  # optional vision tower
         else:
             self.visual = None
+
+    @staticmethod
+    def _apply_deepstack_features(
+        hidden: jax.Array, visual_mask: Optional[jax.Array], features: jax.Array
+    ) -> jax.Array:
+        if visual_mask is None or features.size == 0:
+            return hidden
+
+        def _add(batch_hidden, mask_row, feat_row):
+            if feat_row.shape[0] == 0:
+                return batch_hidden
+            idx = jnp.where(mask_row, size=feat_row.shape[0], fill_value=-1)[0]
+            valid = idx >= 0
+            idx = jnp.where(valid, idx, 0)
+            updates = jnp.where(
+                valid[:, None],
+                feat_row.astype(batch_hidden.dtype),
+                jnp.zeros_like(feat_row, dtype=batch_hidden.dtype),
+            )
+            return batch_hidden.at[idx].add(updates)
+
+        return jax.vmap(_add)(hidden, visual_mask.astype(bool), features)
 
     def _decode_from_hidden(
         self,
@@ -704,9 +747,12 @@ class Qwen25VLModel(nn.Module):
         sin: jax.Array,
         mask: Optional[jax.Array] = None,
         cache: Optional[KVCache] = None,
+        visual_mask: Optional[jax.Array] = None,
+        deepstack: Optional[tuple[jax.Array, ...]] = None,
     ) -> tuple[jax.Array, Optional[KVCache]]:
         new_cache = cache
         last_layer_idx = len(self.layers) - 1
+        deepstack = deepstack or ()
         for layer_id, layer in enumerate(self.layers):
             hidden, new_cache = layer(
                 hidden,
@@ -717,6 +763,8 @@ class Qwen25VLModel(nn.Module):
                 layer_id,
                 update_lengths=bool(cache is not None and layer_id == last_layer_idx),  # bump cache len at last layer
             )
+            if deepstack and layer_id < len(deepstack) and visual_mask is not None:
+                hidden = self._apply_deepstack_features(hidden, visual_mask, deepstack[layer_id])
         hidden = self.final_norm(hidden)
         logits = self.lm_head(hidden.astype(jnp.float32))  # keep logits in fp32
         return logits, new_cache
@@ -735,7 +783,7 @@ class Qwen25VLModel(nn.Module):
     def forward_vlm(
         self,
         tokens: jax.Array,
-        vision_embeds: jax.Array,
+        vision_embeds: Union[jax.Array, VisionEmbeddings],
         image_pad_id: int,
         cos: jax.Array,
         sin: jax.Array,
@@ -743,15 +791,23 @@ class Qwen25VLModel(nn.Module):
         cache: Optional[KVCache] = None,
     ) -> tuple[jax.Array, Optional[KVCache]]:
         hidden = self.embed(tokens)
-        if vision_embeds.ndim == 2:
-            vision_embeds = vision_embeds[None, ...]
-        if vision_embeds.ndim != 3:
-            raise ValueError("vision_embeds must have shape (batch, num_tokens, hidden)")
         batch = hidden.shape[0]
-        if vision_embeds.shape[0] not in (1, batch):
-            raise ValueError("vision_embeds batch dimension must be 1 or match tokens batch")
-        if vision_embeds.shape[0] == 1 and batch > 1:
-            vision_embeds = jnp.tile(vision_embeds, (batch, 1, 1))
+
+        if isinstance(vision_embeds, VisionEmbeddings):
+            vision_pack = vision_embeds.cast(self.dtype).with_batch_dim(batch)
+        else:
+            vision_arr = jnp.asarray(vision_embeds, dtype=self.dtype)
+            if vision_arr.ndim == 2:
+                vision_arr = vision_arr[None, ...]
+            if vision_arr.shape[0] not in (1, batch):
+                raise ValueError(
+                    "vision_embeds batch dimension must be 1 or match tokens batch"
+                )
+            if vision_arr.shape[0] == 1 and batch > 1:
+                vision_arr = jnp.tile(vision_arr, (batch, 1, 1))
+            vision_pack = VisionEmbeddings(tokens=vision_arr, deepstack=())
+
+        visual_mask = (tokens == jnp.int32(image_pad_id))
 
         def _inject(batch_hidden, batch_tokens, batch_vis):
             # overlay vision embeddings at <|image_pad|> positions
@@ -766,13 +822,22 @@ class Qwen25VLModel(nn.Module):
             batch_hidden = batch_hidden.at[pad_positions].set(updates)
             return batch_hidden
 
-        hidden = jax.vmap(_inject)(hidden, tokens, vision_embeds)
-        return self._decode_from_hidden(hidden, cos, sin, mask, cache)
+        hidden = jax.vmap(_inject)(hidden, tokens, vision_pack.tokens)
+        return self._decode_from_hidden(
+            hidden,
+            cos,
+            sin,
+            mask,
+            cache,
+            visual_mask=visual_mask,
+            deepstack=vision_pack.deepstack,
+        )
 
-    def encode_vision(self, pixel_values: jax.Array, grid_thw: jax.Array) -> jax.Array:
+    def encode_vision(self, pixel_values: jax.Array, grid_thw: jax.Array) -> VisionEmbeddings:
         if self.visual is None:
             raise ValueError("Vision backbone not configured for this model")
-        return self.visual(pixel_values, grid_thw)
+        tokens, deepstack = self.visual(pixel_values, grid_thw)
+        return VisionEmbeddings(tokens=tokens, deepstack=tuple(deepstack))
 
     def decode_step(
         self,
@@ -824,20 +889,26 @@ def _load_hf_config(hf_dir: str) -> dict[str, Any]:
         return json.load(f)
 
 
-def spec_from_config(cfg: dict[str, Any]) -> Qwen25VLSpec:
+def spec_from_config(cfg: dict[str, Any]) -> Qwen3VLSpec:
     # Map HF config to our internal spec
     text_cfg = cfg.get("text_config", cfg)
     rope_cfg = text_cfg.get("rope_scaling", cfg.get("rope_scaling", {}))
     # Compute common head_dim once; needed for RoPE section validation
-    _head_dim = text_cfg.get("head_dim", text_cfg["hidden_size"] // text_cfg["num_attention_heads"])
+    _head_dim = text_cfg.get("head_dim")
+    if _head_dim is None:
+        _head_dim = text_cfg["hidden_size"] // text_cfg["num_attention_heads"]
+    else:
+        _head_dim = int(_head_dim)
     vision_cfg = cfg.get("vision_config")
 
     # Parse optional rope scaling type/factor
     rope_scaling_type = None
     rope_scaling_factor = None
+    rope_interleaved = False
     if isinstance(rope_cfg, dict):
         rope_scaling_type = rope_cfg.get("type")
         rope_scaling_factor = rope_cfg.get("factor", rope_cfg.get("finetuned_factor"))
+        rope_interleaved = bool(rope_cfg.get("mrope_interleaved", False))
 
     # Validate/derive rope_section
     raw_section = (rope_cfg.get("mrope_section", None) if isinstance(rope_cfg, dict) else None)
@@ -857,9 +928,10 @@ def spec_from_config(cfg: dict[str, Any]) -> Qwen25VLSpec:
         if vision_cfg is not None and len(rope_section) != 3:
             raise ValueError("rope_scaling.mrope_section must have 3 entries (t,h,w) for vision models")
         expected = _head_dim // 2
-        if sum(rope_section) != expected:
+        total = sum(rope_section)
+        if not rope_interleaved and total != expected:
             raise ValueError(
-                f"Sum of rope_scaling.mrope_section must equal head_dim//2 ({expected}); got {sum(rope_section)}"
+                f"Sum of rope_scaling.mrope_section must equal head_dim//2 ({expected}); got {total}"
             )
     text = TextBackboneSpec(
         hidden_size=text_cfg["hidden_size"],
@@ -872,26 +944,37 @@ def spec_from_config(cfg: dict[str, Any]) -> Qwen25VLSpec:
         rope_section=rope_section,
         rope_scaling_type=rope_scaling_type,
         rope_scaling_factor=(float(rope_scaling_factor) if rope_scaling_factor is not None else None),
+        mrope_interleaved=rope_interleaved,
         rms_norm_eps=text_cfg["rms_norm_eps"],
         vocab_size=text_cfg["vocab_size"],
     )
     vision = None
     if vision_cfg is not None:
+        patch_sz = vision_cfg.get("patch_size", vision_cfg.get("spatial_patch_size"))
+        temporal_patch_sz = vision_cfg.get("temporal_patch_size", vision_cfg.get("temporal_patch", 1))
+        window_size = vision_cfg.get(
+            "window_size",
+            (patch_sz or 1) * vision_cfg.get("spatial_merge_size", 1),
+        )
         vision = VisionBackboneSpec(
             hidden_size=vision_cfg["hidden_size"],
             out_hidden_size=vision_cfg["out_hidden_size"],
             depth=vision_cfg["depth"],
             num_heads=vision_cfg["num_heads"],
             intermediate_size=vision_cfg["intermediate_size"],
-            patch_size=vision_cfg.get("patch_size", vision_cfg.get("spatial_patch_size")),
-            temporal_patch_size=vision_cfg["temporal_patch_size"],
+            patch_size=patch_sz,
+            temporal_patch_size=temporal_patch_sz,
             spatial_merge_size=vision_cfg["spatial_merge_size"],
-            window_size=vision_cfg.get("window_size", 448),
+            window_size=window_size,
             in_channels=vision_cfg.get("in_channels", vision_cfg.get("in_chans", 3)),
-            tokens_per_second=vision_cfg.get("tokens_per_second", 1),
-            fullatt_block_indexes=vision_cfg.get("fullatt_block_indexes", []),
+            fullatt_block_indexes=vision_cfg.get(
+                "fullatt_block_indexes",
+                vision_cfg.get("deepstack_visual_indexes", []),
+            ),
+            num_position_embeddings=vision_cfg.get("num_position_embeddings"),
+            deepstack_visual_indexes=tuple(vision_cfg.get("deepstack_visual_indexes", [])),
         )
-    return Qwen25VLSpec(
+    return Qwen3VLSpec(
         text=text,
         vision=vision,
         pad_token_id=cfg.get("pad_token_id"),
@@ -908,10 +991,14 @@ _TEXT_KEY_RULES = {
     r"model\.language_model\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": r"layers_\1/attn/q_proj/kernel",
     r"model\.language_model\.model\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": r"layers_\1/attn/q_proj/bias",
     r"model\.language_model\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": r"layers_\1/attn/q_proj/bias",
+    r"model\.language_model\.model\.layers\.([0-9]+)\.self_attn\.q_norm\.weight": r"layers_\1/attn/q_norm/weight",
+    r"model\.language_model\.layers\.([0-9]+)\.self_attn\.q_norm\.weight": r"layers_\1/attn/q_norm/weight",
     r"model\.language_model\.model\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": r"layers_\1/attn/k_proj/kernel",
     r"model\.language_model\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": r"layers_\1/attn/k_proj/kernel",
     r"model\.language_model\.model\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": r"layers_\1/attn/k_proj/bias",
     r"model\.language_model\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": r"layers_\1/attn/k_proj/bias",
+    r"model\.language_model\.model\.layers\.([0-9]+)\.self_attn\.k_norm\.weight": r"layers_\1/attn/k_norm/weight",
+    r"model\.language_model\.layers\.([0-9]+)\.self_attn\.k_norm\.weight": r"layers_\1/attn/k_norm/weight",
     r"model\.language_model\.model\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": r"layers_\1/attn/v_proj/kernel",
     r"model\.language_model\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": r"layers_\1/attn/v_proj/kernel",
     r"model\.language_model\.model\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": r"layers_\1/attn/v_proj/bias",
@@ -934,8 +1021,10 @@ _TEXT_KEY_RULES = {
     r"model\.embed_tokens\.weight": "embed/embedding",
     r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": r"layers_\1/attn/q_proj/kernel",
     r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": r"layers_\1/attn/q_proj/bias",
+    r"model\.layers\.([0-9]+)\.self_attn\.q_norm\.weight": r"layers_\1/attn/q_norm/weight",
     r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": r"layers_\1/attn/k_proj/kernel",
     r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": r"layers_\1/attn/k_proj/bias",
+    r"model\.layers\.([0-9]+)\.self_attn\.k_norm\.weight": r"layers_\1/attn/k_norm/weight",
     r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": r"layers_\1/attn/v_proj/kernel",
     r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": r"layers_\1/attn/v_proj/bias",
     r"model\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": r"layers_\1/attn/o_proj/kernel",
@@ -984,6 +1073,16 @@ _VISION_KEY_RULES = {
     r"visual\.merger\.mlp\.2\.weight": "visual/merger/linear2/kernel",
     r"model\.visual\.merger\.mlp\.2\.bias": "visual/merger/linear2/bias",
     r"visual\.merger\.mlp\.2\.bias": "visual/merger/linear2/bias",
+    r"model\.visual\.deepstack_merger_list\.([0-9]+)\.norm\.weight": r"visual/deepstack_mergers_\1/norm/weight",
+    r"visual\.deepstack_merger_list\.([0-9]+)\.norm\.weight": r"visual/deepstack_mergers_\1/norm/weight",
+    r"model\.visual\.deepstack_merger_list\.([0-9]+)\.linear_fc1\.weight": r"visual/deepstack_mergers_\1/linear1/kernel",
+    r"visual\.deepstack_merger_list\.([0-9]+)\.linear_fc1\.weight": r"visual/deepstack_mergers_\1/linear1/kernel",
+    r"model\.visual\.deepstack_merger_list\.([0-9]+)\.linear_fc1\.bias": r"visual/deepstack_mergers_\1/linear1/bias",
+    r"visual\.deepstack_merger_list\.([0-9]+)\.linear_fc1\.bias": r"visual/deepstack_mergers_\1/linear1/bias",
+    r"model\.visual\.deepstack_merger_list\.([0-9]+)\.linear_fc2\.weight": r"visual/deepstack_mergers_\1/linear2/kernel",
+    r"visual\.deepstack_merger_list\.([0-9]+)\.linear_fc2\.weight": r"visual/deepstack_mergers_\1/linear2/kernel",
+    r"model\.visual\.deepstack_merger_list\.([0-9]+)\.linear_fc2\.bias": r"visual/deepstack_mergers_\1/linear2/bias",
+    r"visual\.deepstack_merger_list\.([0-9]+)\.linear_fc2\.bias": r"visual/deepstack_mergers_\1/linear2/bias",
 }
 
 
@@ -995,15 +1094,16 @@ def _torch_key_to_flax(key: str) -> Optional[str]:
     return None
 
 
-def create_model_from_hf(hf_dir: str) -> tuple[Qwen25VLModel, dict[str, Any]]:
+def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
     cfg = _load_hf_config(hf_dir)
     spec = spec_from_config(cfg)
-    model = Qwen25VLModel(spec)
+    model = Qwen3VLModel(spec)
 
     dummy_ids = jnp.zeros((1, 1), dtype=jnp.int32)
     rope_axes = len(tuple(int(x) for x in spec.text.rope_section))
-    dummy_cos = jnp.zeros((rope_axes, 1, 1, spec.text.head_dim), dtype=model.dtype)
-    dummy_sin = jnp.zeros((rope_axes, 1, 1, spec.text.head_dim), dtype=model.dtype)
+    rope_dim = sum(int(x) for x in spec.text.rope_section) * 2
+    dummy_cos = jnp.zeros((rope_axes, 1, 1, rope_dim), dtype=model.dtype)
+    dummy_sin = jnp.zeros((rope_axes, 1, 1, rope_dim), dtype=model.dtype)
     text_vars = model.init(jax.random.PRNGKey(0), dummy_ids, dummy_cos, dummy_sin)
     param_dict = flax.core.unfreeze(text_vars["params"])
 
@@ -1076,19 +1176,19 @@ def create_model_from_hf(hf_dir: str) -> tuple[Qwen25VLModel, dict[str, Any]]:
     return model, flax.core.freeze(param_dict)
 
 
-def create_model_from_ckpt(ckpt_dir: str) -> tuple[Qwen25VLModel, dict[str, Any]]:
+def create_model_from_ckpt(ckpt_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
     from vlmrl.utils.checkpoint import Checkpoint
 
     cfg = _load_hf_config(ckpt_dir)
     spec = spec_from_config(cfg)
-    model = Qwen25VLModel(spec)
+    model = Qwen3VLModel(spec)
     ckpt = Checkpoint(f"{ckpt_dir}/params.pkl", parallel=False)
     params = ckpt.load_as_dict()["params"]
     return model, params
 
 
 __all__ = [
-    "Qwen25VLModel",
+    "Qwen3VLModel",
     "KVCache",
     "apply_multimodal_rotary_pos_emb",
     "build_text_rope",

@@ -53,14 +53,30 @@ def create_sharding(shard_type, train_state_shape=None):
     #     representing the data on all hosts, but only part will be addressable on this host.
     def shard_data(*args):
         def _shard_data(x):
-            if jax.local_device_count() == jax.device_count():
+            # Fallback to replication if the leading dim isn't divisible by device count.
+            # This avoids ValueError from uneven partitioning on device_put/make_array.
+            if x is None:
+                return None
+            if x.ndim == 0:
+                return jax.device_put(x, no_shard)
+
+            local_devs = len(mesh.local_devices)
+            total_devs = jax.device_count()
+
+            if jax.local_device_count() == total_devs:
+                # Single-host case
+                if x.shape[0] == 0 or (x.shape[0] % max(1, total_devs) != 0):
+                    return jax.device_put(x, no_shard)
                 return jax.device_put(x, data_sharding)
             else:
+                # Multi-host case
+                if x.shape[0] == 0 or (x.shape[0] % max(1, local_devs) != 0):
+                    return jax.device_put(x, no_shard)
                 # Increases the first dimension by num_hosts. X is no longer fully addressable.
                 x_shape = (x.shape[0] * num_hosts, *x.shape[1:])
-                x = np.split(x, len(mesh.local_devices), axis = 0) # per device data, but on host
-                x = jax.device_put(x, mesh.local_devices) # per device data, now on device
-                return jax.make_array_from_single_device_arrays(x_shape, data_sharding, x)
+                x_split = np.split(x, local_devs, axis=0)  # per-device data, on host
+                x_dev = jax.device_put(x_split, mesh.local_devices)  # per-device data, on device
+                return jax.make_array_from_single_device_arrays(x_shape, data_sharding, x_dev)
         if len(args) == 1:
             return _shard_data(args[0])
         return jax.tree_map(_shard_data, args)

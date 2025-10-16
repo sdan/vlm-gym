@@ -7,7 +7,7 @@ import shutil
 ############
 # A checkpointer class for flax models, compatible with saving/loading from gs:// buckets.
 # From https://github.com/danijar/elements/blob/main/elements/checkpoint.py
-# Taken from: https://github.com/danijar/elements/blob/main/elements/checkpoint.py
+# Originally from: https://github.com/danijar/elements/blob/main/elements/checkpoint.py
 ############
 
 def parent_dir(filename):

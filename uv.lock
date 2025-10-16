@@ -569,6 +569,27 @@ http = [
 ]
 
 [[package]]
+name = "geographiclib"
+version = "2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/df/78/4892343230a9d29faa1364564e525307a37e54ad776ea62c12129dbba704/geographiclib-2.1.tar.gz", hash = "sha256:6a6545e6262d0ed3522e13c515713718797e37ed8c672c31ad7b249f372ef108", size = 37004, upload-time = "2025-08-21T21:34:26Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/31/b3/802576f2ea5dcb48501bb162e4c7b7b3ca5654a42b2c968ef98a797a4c79/geographiclib-2.1-py3-none-any.whl", hash = "sha256:e2a873b9b9e7fc38721ad73d5f4e6c9ed140d428a339970f505c07056997d40b", size = 40740, upload-time = "2025-08-21T21:34:24.955Z" },
+]
+
+[[package]]
+name = "geopy"
+version = "2.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "geographiclib" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0e/fd/ef6d53875ceab72c1fad22dbed5ec1ad04eb378c2251a6a8024bad890c3b/geopy-2.4.1.tar.gz", hash = "sha256:50283d8e7ad07d89be5cb027338c6365a32044df3ae2556ad3f52f4840b3d0d1", size = 117625, upload-time = "2023-11-23T21:49:32.734Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/15/cf2a69ade4b194aa524ac75112d5caac37414b20a3a03e6865dfe0bd1539/geopy-2.4.1-py3-none-any.whl", hash = "sha256:ae8b4bc5c1131820f4d75fce9d4aaaca0c85189b3aa5d64c3dcaf5e3b7b882a7", size = 125437, upload-time = "2023-11-23T21:49:30.421Z" },
+]
+
+[[package]]
 name = "gitdb"
 version = "4.0.12"
 source = { registry = "https://pypi.org/simple" }
@@ -973,6 +994,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/53/21/783dfb51f40d2660afeb9bccf3612b99f6a803d980d2a09132b0f9d216ab/ml_dtypes-0.5.3-cp314-cp314t-macosx_10_13_universal2.whl", hash = "sha256:e12e29764a0e66a7a31e9b8bf1de5cc0423ea72979f45909acd4292de834ccd3", size = 689324, upload-time = "2025-07-29T18:39:07.567Z" },
     { url = "https://files.pythonhosted.org/packages/09/f7/a82d249c711abf411ac027b7163f285487f5e615c3e0716c61033ce996ab/ml_dtypes-0.5.3-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:19f6c3a4f635c2fc9e2aa7d91416bd7a3d649b48350c51f7f715a09370a90d93", size = 5275917, upload-time = "2025-07-29T18:39:09.339Z" },
     { url = "https://files.pythonhosted.org/packages/7f/3c/541c4b30815ab90ebfbb51df15d0b4254f2f9f1e2b4907ab229300d5e6f2/ml_dtypes-0.5.3-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5ab039ffb40f3dc0aeeeba84fd6c3452781b5e15bef72e2d10bcb33e4bbffc39", size = 5285284, upload-time = "2025-07-29T18:39:11.532Z" },
+]
+
+[[package]]
+name = "more-itertools"
+version = "10.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/5d/38b681d3fce7a266dd9ab73c66959406d565b3e85f21d5e66e1181d93721/more_itertools-10.8.0.tar.gz", hash = "sha256:f638ddf8a1a0d134181275fb5d58b086ead7c6a72429ad725c67503f13ba30bd", size = 137431, upload-time = "2025-09-02T15:23:11.018Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/8e/469e5a4a2f5855992e425f3cb33804cc07bf18d48f2db061aec61ce50270/more_itertools-10.8.0-py3-none-any.whl", hash = "sha256:52d4362373dcf7c52546bc4af9a86ee7c4579df9a8dc268be0a2f949d376cc9b", size = 69667, upload-time = "2025-09-02T15:23:09.635Z" },
 ]
 
 [[package]]
@@ -2739,6 +2769,56 @@ wheels = [
 ]
 
 [[package]]
+name = "trame"
+version = "3.12.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+    { name = "trame-client" },
+    { name = "trame-common" },
+    { name = "trame-server" },
+    { name = "wslink" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/35/ac/ebd44ac237841d131314e41e0b1654926b77517b0553d7a7f4227778db07/trame-3.12.0.tar.gz", hash = "sha256:88b861162cb8b025e84e93f17dcfd43a84d02d2c1608c9f6d58e3cd646a50c05", size = 23493, upload-time = "2025-08-18T20:21:40.655Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/70/15/5869b2c7556fce52306b6b65b06ec7c088f063b865cdfa75ad30bc229b7c/trame-3.12.0-py3-none-any.whl", hash = "sha256:9b33020625e0d1710d060c0fabe7b3be0e31b5e5138439ec9a796faf6fe96915", size = 28516, upload-time = "2025-08-18T20:21:39.037Z" },
+]
+
+[[package]]
+name = "trame-client"
+version = "3.11.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "trame-common" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ae/a5/febe01d66c7524882c5f4f3e75affbf112896b660a8a53ddc505eeaa57f7/trame_client-3.11.2.tar.gz", hash = "sha256:98b3f09d0fbdb09cd29eac61c945a76dcad4a08cfb4843abce5a148fd6fc7316", size = 240877, upload-time = "2025-10-08T16:09:56.837Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0f/3b/defac846c42dfaf27090d8294fbda0cbbeeb2e80b4b651841cc0e8f35d34/trame_client-3.11.2-py3-none-any.whl", hash = "sha256:f4d9364ea89cdb9d128fcebe4ab5034e5c20662feb5fee858cfe2eca3dea4771", size = 245066, upload-time = "2025-10-08T16:09:55.25Z" },
+]
+
+[[package]]
+name = "trame-common"
+version = "1.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9b/81/fca0fde4ce06d6afafacfe44fc3989a7d89982a4a83c3252fe3679ecaaeb/trame_common-1.0.1.tar.gz", hash = "sha256:9d4af2d9a6d08a7405977f459931cab9d4b53ae120a80264545f679d1f9a94bc", size = 18375, upload-time = "2025-07-27T04:45:24.794Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4f/9a/e77b16b3f13d87afd2c741dbee0e3affe859f0f2ac5641da8ffe5de8748f/trame_common-1.0.1-py3-none-any.whl", hash = "sha256:b8f568a6f917a511f9e24060e20b8a95860729b10307ac04d2336d6780e3a2e6", size = 21687, upload-time = "2025-07-27T04:45:23.323Z" },
+]
+
+[[package]]
+name = "trame-server"
+version = "3.6.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "more-itertools" },
+    { name = "wslink" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5e/63/50b22cc72caaf1a18c15215ce42a67eae3a991113eeddb961d2227c1e5c9/trame_server-3.6.3.tar.gz", hash = "sha256:88e93b3352bd5dfe83c82ab2e2b77f8173753d065076134b69c26ba9f48f8a9b", size = 38985, upload-time = "2025-10-06T14:26:33.244Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/8e/1713aa775e2a35d981bb545e17e2944e453f4fb41f8405905421be38975a/trame_server-3.6.3-py3-none-any.whl", hash = "sha256:8708953d5533e9deb447c6b560c2cd2c2f692c27c9afb251e842f2e5d37e8efc", size = 43698, upload-time = "2025-10-06T14:26:32.09Z" },
+]
+
+[[package]]
 name = "transformers"
 version = "4.57.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2837,6 +2917,7 @@ dependencies = [
     { name = "datasets" },
     { name = "einops" },
     { name = "flax" },
+    { name = "geopy" },
     { name = "jax", extra = ["cuda12"] },
     { name = "jaxtyping" },
     { name = "ml-collections" },
@@ -2848,6 +2929,7 @@ dependencies = [
     { name = "pycountry" },
     { name = "torch" },
     { name = "tqdm" },
+    { name = "trame" },
     { name = "transformers" },
     { name = "wandb" },
 ]
@@ -2859,6 +2941,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=4.1.1" },
     { name = "einops" },
     { name = "flax", specifier = "==0.10.6" },
+    { name = "geopy", specifier = ">=2.4.1" },
     { name = "jax", extras = ["cuda12"], specifier = "==0.6.1" },
     { name = "jaxtyping" },
     { name = "ml-collections" },
@@ -2869,6 +2952,7 @@ requires-dist = [
     { name = "pycountry", specifier = ">=24.6.1" },
     { name = "torch" },
     { name = "tqdm" },
+    { name = "trame", specifier = ">=3.12.0" },
     { name = "transformers" },
     { name = "wandb" },
 ]
@@ -2909,6 +2993,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/30/43/ae3fa46e20b1d9a6508dd9abe716d57205c038ed4661c5c98ace48a60eac/wandb-0.22.2-py3-none-win32.whl", hash = "sha256:44d12bd379dbe15be5ceed6bdf23803d42f648ba0dd111297b4c47a3c7be6dbd", size = 19075950, upload-time = "2025-10-07T19:54:14.892Z" },
     { url = "https://files.pythonhosted.org/packages/09/59/c174321e868205f7a659d1e5ec51f546e62267296d6f4179bb9119294964/wandb-0.22.2-py3-none-win_amd64.whl", hash = "sha256:c95eb221bf316c0872f7ac55071856b9f25f95a2de983ada48acf653ce259386", size = 19075953, upload-time = "2025-10-07T19:54:16.837Z" },
     { url = "https://files.pythonhosted.org/packages/7a/a2/c7c24fda78513cab5686949d8cb36459dbbccbbb4b2b6fc67237ece31a00/wandb-0.22.2-py3-none-win_arm64.whl", hash = "sha256:20d2ab9aa10445aab3d60914a980f002a4f66566e28b0cd156b1e462f0080a0d", size = 17383217, upload-time = "2025-10-07T19:54:19.384Z" },
+]
+
+[[package]]
+name = "wslink"
+version = "2.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "msgpack" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/88/1e/7de3247eb84c9eaa9ab7e6feb13a1fa2cf339dbff21cd98ee2f107c74fa8/wslink-2.4.0.tar.gz", hash = "sha256:038d5a4fecb18cbedab3754f9db8265c3c794ac72133e47d4b3303d50c64c758", size = 31864, upload-time = "2025-08-18T19:40:26.065Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/59/fb/5cebce5a54002fa36560ab1426ceead210da8ff5cfd0a4937ca0cfd9f13f/wslink-2.4.0-py3-none-any.whl", hash = "sha256:449ec1da5ad5f2ac6084212230ddbf65f5104cfd1d55914e278b412da10bcd27", size = 36844, upload-time = "2025-08-18T19:40:24.671Z" },
 ]
 
 [[package]]

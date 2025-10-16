@@ -1,3 +1,7 @@
+scripts/
+.DS_Store
+runs/
+notebooks/
 checkpoints/
 viz/manim/*.mp4
 viz/manim/*.txt

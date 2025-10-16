@@ -1,15 +1,19 @@
 """
-From https://github.com/kvfrans/lmpo/tree/main/utils
+Adapted from https://github.com/kvfrans/lmpo/tree/main/utils
 """
 from argparse import ArgumentParser
+import importlib
 import os
+import sys
 import shutil
 from typing import Optional
 
 from flax.core import unfreeze
 from huggingface_hub import snapshot_download
 
-from models.qwen25vl import create_model_from_hf
+# Add project root to path to enable imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from vlmrl.utils.checkpoint import Checkpoint
 
 
@@ -41,7 +45,13 @@ def _resolve_hf_dir(
 
 
 def main() -> None:
-    parser = ArgumentParser(description="Convert HF Qwen2.5-VL weights to a JAX checkpoint.")
+    parser = ArgumentParser(description="Convert HF Qwen VL weights to a JAX checkpoint.")
+    parser.add_argument(
+        "--model_type",
+        default="qwen3vl",
+        choices=["qwen25vl", "qwen3vl"],
+        help="Model type: qwen25vl or qwen3vl.",
+    )
     parser.add_argument(
         "--model_dir",
         required=True,
@@ -54,8 +64,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--hf_repo",
-        default="Qwen/Qwen2.5-VL-7B-Instruct",
-        help="HF repo ID to download when --hf_dir is not provided.",
+        default=None,
+        help="HF repo ID to download when --hf_dir is not provided. If omitted, uses default based on --model_type.",
     )
     parser.add_argument(
         "--revision",
@@ -70,12 +80,23 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Set default repo based on model type if not provided
+    if args.hf_repo is None:
+        args.hf_repo = {
+            "qwen25vl": "Qwen/Qwen2.5-VL-7B-Instruct",
+            "qwen3vl": "Qwen/Qwen3-VL-4B-Instruct",
+        }[args.model_type]
+
     ckpt_dir = _ensure_trailing_slash(os.path.expanduser(args.model_dir))
     os.makedirs(ckpt_dir, exist_ok=True)
 
     # Resolve or download HF snapshot
     hf_dir = _resolve_hf_dir(args.hf_dir, args.hf_repo, args.revision, args.cache_dir)
     print(f"Using HF snapshot at: {hf_dir}")
+
+    # Dynamic import based on model type
+    model_module = importlib.import_module(f"models.{args.model_type}")
+    create_model_from_hf = model_module.create_model_from_hf
 
     # Build model and convert params
     _, params = create_model_from_hf(hf_dir)
@@ -87,11 +108,25 @@ def main() -> None:
     ckpt.save()
 
     # Copy relevant config/tokenizer files
-    for fname in ("config.json", "tokenizer_config.json", "tokenizer.json"):
+    base_files = [
+        "config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "preprocessor_config.json",
+        "generation_config.json",
+        "chat_template.json",
+    ]
+
+    # Add video_preprocessor_config.json for Qwen3-VL
+    if args.model_type == "qwen3vl":
+        base_files.append("video_preprocessor_config.json")
+
+    for fname in base_files:
         src = os.path.join(hf_dir, fname)
         dst = os.path.join(ckpt_dir, fname)
         if os.path.exists(src):
             shutil.copy(src, dst)
+            print(f"Copied: {fname}")
         else:
             print(f"Warning: {fname} not found in HF directory; skipped copy.")
 

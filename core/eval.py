@@ -1,429 +1,633 @@
-import jax.numpy as jnp
-import jax
-import json
-import numpy as np
-import tqdm
-import ml_collections
-import sys
-from absl import flags
+"""Benchmark and smoke test for the unified JAX sampler.
 
+This entry point now supports comparing the JAX sampler against a Hugging Face
+PyTorch reference model and reports basic latency/throughput statistics.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import statistics
+import time
+from dataclasses import replace
+from typing import Any, Dict, List, Optional, Sequence, Union
+
+import jax
+import jax.numpy as jnp
 from transformers import AutoTokenizer
 
-from vlmrl.models.qwen25vl import create_model_from_ckpt
-from vlmrl.utils.configs import define_flag_dict
-from vlmrl.envs.env_creator import create_env
-from vlmrl.utils.sharding import create_sharding, host_gather
-from vlmrl.core.sampling import Sampler as VLMSampler, _resolve_image_pad_id
-from vlmrl.utils.vlm import (
-    preprocess_image,
-    chat_prompt_with_image,
-    chat_prompt_with_images,
-    DEFAULT_MIN_PIXELS,
-    DEFAULT_MAX_PIXELS,
-)
+from vlmrl.core.types import SampleResult, SamplingConfig, VLMInputs
+from vlmrl.core.sampling import sample as unified_sample
+from vlmrl.models.qwen3vl.model import VisionEmbeddings, create_model_from_ckpt as create_model_qwen3
+from vlmrl.utils.vlm import preprocess_image, chat_prompt_with_image, decode_tokens, extract_assistant
+from vlmrl.utils.rng import RngSeq
 
-def eval_model(
+
+def _resolve_pad_eos(tokenizer, model, pad_id_flag: Optional[int]) -> tuple[int, Optional[int]]:
+    pad_id = (
+        int(pad_id_flag)
+        if pad_id_flag is not None
+        else (getattr(tokenizer, "pad_token_id", None) or getattr(model.spec, "pad_token_id", 0) or 0)
+    )
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is None:
+        eos_id = getattr(model.spec, "eos_token_id", None)
+    return int(pad_id), (int(eos_id) if eos_id is not None else None)
+
+
+def _resolve_image_pad_id(tokenizer, ckpt_dir: str) -> int:
+    """Resolve the special <image> placeholder token id for Qwen3.
+
+    Tries tokenizer first; falls back to checkpoint config.json.
+    """
+    import json, os
+    try:
+        image_pad = getattr(tokenizer, "image_token_id", None)
+        if image_pad is not None and int(image_pad) >= 0:
+            return int(image_pad)
+        special = getattr(tokenizer, "special_tokens_map", None)
+        if isinstance(special, dict):
+            image_pad = special.get("image_token_id", None)
+            if image_pad is not None and int(image_pad) >= 0:
+                return int(image_pad)
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(ckpt_dir, "config.json"), "r") as f:
+            cfg = json.load(f)
+        return int(cfg.get("image_token_id", 151655))
+    except Exception:
+        return 151655
+
+
+def _ensure_ready(result: SampleResult) -> None:
+    """Block until the JAX computation backing `result` has finished."""
+    tokens = result.tokens
+    if isinstance(tokens, jax.Array):
+        jax.block_until_ready(tokens)
+    if result.logprobs is not None and isinstance(result.logprobs, jax.Array):
+        jax.block_until_ready(result.logprobs)
+
+
+def _summaries_from_metrics(metrics: Sequence[Dict[str, float]]) -> Dict[str, float]:
+    """Aggregate timing metrics collected over multiple runs."""
+    if not metrics:
+        return {}
+    durations = [m["duration"] for m in metrics]
+    tokens = [m.get("tokens", 0.0) for m in metrics]
+    throughputs = [
+        (tok / dur) if dur > 0 else 0.0
+        for tok, dur in zip(tokens, durations, strict=False)
+    ]
+    summary = {
+        "runs": len(durations),
+        "duration_mean": statistics.mean(durations),
+        "duration_std": statistics.pstdev(durations) if len(durations) > 1 else 0.0,
+        "tokens_total": sum(tokens),
+        "throughput_mean": statistics.mean(throughputs),
+        "throughput_std": statistics.pstdev(throughputs) if len(throughputs) > 1 else 0.0,
+    }
+    if len(durations) > 1:
+        steady = durations[1:]
+        steady_tokens = tokens[1:]
+        steady_tp = [
+            (tok / dur) if dur > 0 else 0.0
+            for tok, dur in zip(steady_tokens, steady, strict=False)
+        ]
+        summary.update({
+            "steady_duration_mean": statistics.mean(steady),
+            "steady_throughput_mean": statistics.mean(steady_tp),
+        })
+    return summary
+
+
+def _format_summary_table(title: str, summary: Dict[str, float], first_token: Optional[float]) -> str:
+    lines = [f"{title}:"]
+    if not summary:
+        lines.append("  (no data)")
+        return "\n".join(lines)
+    lines.append(f"  runs: {summary['runs']}")
+    lines.append(f"  mean duration: {summary['duration_mean']:.3f}s (std {summary['duration_std']:.3f})")
+    lines.append(f"  total tokens: {int(summary['tokens_total'])}")
+    lines.append(f"  mean throughput: {summary['throughput_mean']:.2f} tok/s (std {summary['throughput_std']:.2f})")
+    if "steady_duration_mean" in summary:
+        lines.append(f"  steady-state duration: {summary['steady_duration_mean']:.3f}s")
+        lines.append(f"  steady-state throughput: {summary['steady_throughput_mean']:.2f} tok/s")
+    if first_token is not None:
+        lines.append(f"  first-token latency (1 new token run): {first_token:.3f}s")
+    return "\n".join(lines)
+
+
+def _ensure_parent_dir(path: Optional[str]) -> None:
+    if not path:
+        return
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+
+def _benchmark_jax(
     model,
     params,
-    env,
-    num_generation_tokens,
-    force_answer_at,
-    prompt_length,
-    inference_batch_per_device,
-    pad_id,
-    shard_data_fn,
-    no_shard,
-    data_shard,
-    num_epochs,
-    *,
-    tokenizer=None,
-    vlm_sampler: VLMSampler | None = None,
-    image_pad_id: int | None = None,
-    eos_token_id: int | None = None,
-    vlm_min_pixels: int | None = None,
-    vlm_max_pixels: int | None = None,
-    top_k: int | None = None,
-    top_p: float | None = None,
-    temperature: float = 1.0,
-    max_eval_tasks: int | None = None,
-):
-    np.random.seed(jax.process_index())
-    env_num_tasks = env.num_tasks if env.num_tasks != -1 else 512
-    # Optionally cap how many tasks to evaluate for faster, partial runs
-    if max_eval_tasks is not None and int(max_eval_tasks) > 0:
-        env_num_tasks = min(env_num_tasks, int(max_eval_tasks))
-    total_num_tasks = num_epochs * env_num_tasks
-    env_task_idx = 0
-    rollout_batch_size = jax.local_device_count() * inference_batch_per_device
-    global_batch_size = rollout_batch_size * jax.process_count()
-    rng = jax.random.PRNGKey(jax.process_index())
+    inputs: Union[VLMInputs, jnp.ndarray],
+    cfg: SamplingConfig,
+    rng_seq: RngSeq,
+    tokenizer,
+    runs: int,
+) -> tuple[SampleResult, Dict[str, float], Optional[float]]:
+    metrics: List[Dict[str, float]] = []
+    last_result: Optional[SampleResult] = None
+    measured_runs = max(1, int(runs))
+    warmup_runs = 1 if measured_runs > 0 else 0
 
-    env_infos_history = {}
-    env_infos_history['return'] = []
-    for i in tqdm.tqdm(range(total_num_tasks // global_batch_size + 1)):
-        env_states, env_tokens = [], []
-        for _ in range(rollout_batch_size):
-            env_state, output_tokens = env.reset(min(env_task_idx + jax.process_index(), env_num_tasks-1))
-            env_task_idx += jax.process_count()
-            env_task_idx = env_task_idx % env_num_tasks
-            env_states.append(env_state)
-            env_tokens.append(output_tokens)
+    # Prefill compilation cache with an untimed warm-up pass
+    for idx in range(warmup_runs + measured_runs):
+        key = rng_seq.next()
+        start = time.perf_counter()
+        result = unified_sample(
+            model,
+            params,
+            inputs,
+            cfg,
+            key,
+            tokenizer=tokenizer,
+            return_logprobs=False,
+        )
+        _ensure_ready(result)
+        elapsed = time.perf_counter() - start
+        if idx >= warmup_runs:
+            tokens_generated = int(result.tokens.shape[1]) if result.tokens.ndim == 2 else 0
+            metrics.append({"duration": elapsed, "tokens": tokens_generated})
+            last_result = result
+        else:
+            # Warm-up result is only used to trigger compilation
+            last_result = result
 
-        # VLM path only: sample one-by-one via VLMSampler (batch=1 only)
-        if vlm_sampler is None or tokenizer is None:
-            raise ValueError("VLM sampling requires `vlm_sampler` and `tokenizer`.")
-
-        if image_pad_id is None:
-            raise ValueError("VLM sampling requires `image_pad_id`.")
-
-        # Resolve EOS token id if available
-        eos_id = eos_token_id
-        if eos_id is None and hasattr(tokenizer, "eos_token_id"):
-            eos_id = getattr(tokenizer, "eos_token_id")
-
-        action_tokens_list = []
-        for obs in env_tokens:
-            # Single-image vision caption env (supports path or PIL image)
-            if hasattr(obs, "question") and (hasattr(obs, "image_path") or hasattr(obs, "image")):
-                vision_spec = model.spec.vision
-                if vision_spec is None:
-                    raise ValueError("This VLM checkpoint has no vision backbone configured.")
-                image_input = getattr(obs, "image_path", None)
-                if image_input is None:
-                    image_input = getattr(obs, "image", None)
-                pixel_values, grid_thw = preprocess_image(
-                    image_input,
-                    patch_size=vision_spec.patch_size,
-                    spatial_merge_size=vision_spec.spatial_merge_size,
-                    temporal_patch_size=vision_spec.temporal_patch_size,
-                    min_pixels=(vlm_min_pixels if (vlm_min_pixels and vlm_min_pixels > 0) else DEFAULT_MIN_PIXELS),
-                    max_pixels=(vlm_max_pixels if (vlm_max_pixels and vlm_max_pixels > 0) else DEFAULT_MAX_PIXELS),
-                )
-                # Encode vision on first device without sharding (batch=1)
-                vision_embeds = model.apply({"params": params}, pixel_values, grid_thw, method=model.encode_vision)
-                num_vision_tokens = int(vision_embeds.shape[0])
-                prompt_text = chat_prompt_with_image(num_vision_tokens, obs.question)
-                # Debug: Print the prompt to verify it contains the question
-                if jax.process_index() == 0:  # Only print from first process
-                    print(f"\n[DEBUG] Full prompt text being sent to model:")
-                    print(f"Question from obs: {obs.question}")
-                    print(f"Number of vision tokens: {num_vision_tokens}")
-                    # Truncate the prompt for display (avoid showing all image_pad tokens)
-                    display_prompt = prompt_text.replace('<|image_pad|>' * num_vision_tokens, f'<|image_pad|>*{num_vision_tokens}')
-                    print(f"Formatted prompt: {display_prompt}")
-                    print("-" * 80)
-
-                input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-                prompt_tokens = jnp.asarray([input_ids], dtype=jnp.int32)
-
-                rng, key = jax.random.split(rng)
-                generated, _ = vlm_sampler.sample_vlm(
-                    prompt_tokens,
-                    vision_embeds,
-                    grid_thw,
-                    image_pad_id=image_pad_id,
-                    max_new_tokens=num_generation_tokens if num_generation_tokens > 0 else env.tokens_per_action,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    eos_id=eos_id,
-                    pad_id=pad_id,
-                    rng=key,
-                    return_logprobs=False,
-                )
-                # Debug: Decode and print the generated response
-                if jax.process_index() == 0:  # Only print from first process
-                    generated_text = tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
-                    print(f"[DEBUG] Generated response: {generated_text}")
-                    print("-" * 80)
-                action_tokens_list.append(generated[0].tolist())
-            # NLVR2-style two-image prompt
-            elif hasattr(obs, "image_left") and hasattr(obs, "image_right") and hasattr(obs, "statement"):
-                vision_spec = model.spec.vision
-                if vision_spec is None:
-                    raise ValueError("This VLM checkpoint has no vision backbone configured.")
-                # preprocess both images (PIL or arrays supported)
-                pix_l, grid_l = preprocess_image(
-                    obs.image_left,
-                    patch_size=vision_spec.patch_size,
-                    spatial_merge_size=vision_spec.spatial_merge_size,
-                    temporal_patch_size=vision_spec.temporal_patch_size,
-                    min_pixels=(vlm_min_pixels if (vlm_min_pixels and vlm_min_pixels > 0) else DEFAULT_MIN_PIXELS),
-                    max_pixels=(vlm_max_pixels if (vlm_max_pixels and vlm_max_pixels > 0) else DEFAULT_MAX_PIXELS),
-                )
-                pix_r, grid_r = preprocess_image(
-                    obs.image_right,
-                    patch_size=vision_spec.patch_size,
-                    spatial_merge_size=vision_spec.spatial_merge_size,
-                    temporal_patch_size=vision_spec.temporal_patch_size,
-                    min_pixels=(vlm_min_pixels if (vlm_min_pixels and vlm_min_pixels > 0) else DEFAULT_MIN_PIXELS),
-                    max_pixels=(vlm_max_pixels if (vlm_max_pixels and vlm_max_pixels > 0) else DEFAULT_MAX_PIXELS),
-                )
-                emb_l = model.apply({"params": params}, pix_l, grid_l, method=model.encode_vision)
-                emb_r = model.apply({"params": params}, pix_r, grid_r, method=model.encode_vision)
-                vision_embeds = jnp.concatenate([emb_l, emb_r], axis=0)
-                grid_thw = jnp.concatenate([grid_l, grid_r], axis=0)
-                num_tokens_l = int(emb_l.shape[0])
-                num_tokens_r = int(emb_r.shape[0])
-                question = f"Look at the two images. {obs.statement} True or False?"
-                prompt_text = chat_prompt_with_images([num_tokens_l, num_tokens_r], question)
-                input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-                prompt_tokens = jnp.asarray([input_ids], dtype=jnp.int32)
-
-                rng, key = jax.random.split(rng)
-                generated, _ = vlm_sampler.sample_vlm(
-                    prompt_tokens,
-                    vision_embeds,
-                    grid_thw,
-                    image_pad_id=image_pad_id,
-                    max_new_tokens=num_generation_tokens if num_generation_tokens > 0 else env.tokens_per_action,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    eos_id=eos_id,
-                    pad_id=pad_id,
-                    rng=key,
-                    return_logprobs=False,
-                )
-                # Debug: Decode and print the generated response
-                if jax.process_index() == 0:  # Only print from first process
-                    generated_text = tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
-                    print(f"[DEBUG] Generated response: {generated_text[:200]}...")  # First 200 chars
-                    print("-" * 80)
-                action_tokens_list.append(generated[0].tolist())
-            else:
-                raise ValueError(
-                    "This eval only supports VLM envs with a single image + question, or NLVR2 with two images + statement."
-                )
-
-        new_states, _, returns_local, dones, env_infos = env.step_list(env_states, action_tokens_list)
-        assert dones[0] # Only supports bandit envs for now.
-        returns_local = np.array(returns_local)
-        returns = host_gather(shard_data_fn(returns_local))
-        for k, v in env_infos.items():
-            if k not in env_infos_history:
-                env_infos_history[k] = []
-            # We only shard/gather when we have a full local batch of simple numeric scalars.
-            full_batch_len = rollout_batch_size
-            current_len = len(v)
-            np_v = None
-            np_ok = False
-            # Try to form a 1D numeric array; otherwise treat as non-numeric or ragged.
-            try:
-                candidate = np.array(v)
-                if candidate.ndim == 1 and candidate.dtype.kind in {"i", "u", "f", "b"}:
-                    np_v = candidate
-                    np_ok = True
-            except Exception:
-                np_ok = False
-
-            if current_len == full_batch_len and np_ok:
-                v_global = host_gather(shard_data_fn(np_v))
-                env_infos_history[k] += v_global.tolist()
-            else:
-                # Partial batches or non-scalar/ragged values: extend locally.
-                env_infos_history[k] += list(v)
-        env_infos_history['return'] += returns.tolist()
-    def _safe_numpy(x_list):
-        try:
-            arr = np.array(x_list)
-        except Exception:
-            return x_list  # keep as list when ragged or non-uniform
-        # Keep lists for ragged object arrays
-        if arr.dtype == object:
-            # Attempt to squeeze only scalar-like entries; otherwise, keep as list
-            if all(np.ndim(x) == 0 for x in x_list):
-                return arr[:total_num_tasks]
-            return x_list
-        return arr[:total_num_tasks]
-
-    env_infos_history = {k: _safe_numpy(v) for k, v in env_infos_history.items()}
-    return new_states, env_infos_history
-
-
-
-
-######$###########################################
-### Runnable function to eval a checkpoint on an env.
-##################################################
-if __name__ == '__main__':
-    config = ml_collections.ConfigDict({
-        # model checkpoint directory.
-        'model_dir': '',
-        # env settings.
-        'env_name': 'vision',
-        # Generic env kwargs (JSON). Passed to env constructor.
-        # Example: '{"split":"test","difficulty_schedule":{"0":"city"},"max_samples":200}'
-        'env_kwargs': '',
-        'max_eval_tasks': -1,   # when > 0, limit number of tasks evaluated
-        'num_generation_tokens': 128, # -1 = use default from env.
-        'force_answer_at': -1, # -1 = use default from env.
-        'prompt_length': 256, # Length of the prompt to pad to.
-        'num_epochs': 1,
-        # sampling settings.
-        'inference_batch_per_device': 1, # Set this to the maximum until OOM. Should not affect results.
-        # sharding mode: 'dp' (replicate) or 'fsdp' (shard params)
-        'shard': 'dp',
-        # vision preprocessing caps (override to shrink image tokens and avoid OOM)
-        'vlm_min_pixels': -1,  # use library default when < 1
-        'vlm_max_pixels': 1048576,  # use library default when < 1
-        # optional shortlist to reduce softmax work during decoding
-        'top_k': -1,           # use full-vocab if < 1
-        'top_p': 0.9,          # disabled if <= 0 or >= 1
-        'temperature': 0.7,
-        # logging & debug controls
-        'log_samples': 3,      # print this many response samples
-        'log_truncate': 256,   # truncate printed responses to this many chars
-        'dump_jsonl': '',      # optional path to write all results as JSONL
-        'debug_pdb': 0,        # drop into pdb at end if > 0 (renamed to avoid absl's built-in --pdb)
-    })
-    define_flag_dict(config)
-    FLAGS = flags.FLAGS
-    FLAGS(sys.argv)
-                                            
-    ckpt_dir = FLAGS.model_dir
-    model, params = create_model_from_ckpt(ckpt_dir)
-    rng = jax.random.PRNGKey(0)
-    # Use simple DP sharding to reduce peak memory; avoid pre-resharding params
-    # Sharding: 'dp' (replicate params) or 'fsdp' (shard params across devices)
-    shard_mode = getattr(FLAGS, 'shard', 'dp') if hasattr(FLAGS, 'shard') else 'dp'
-    params_shard, no_shard, data_shard, shard_data_fn = create_sharding(shard_mode, params)
-
-    # Replicate params across all devices for multi-GPU inference
-    # This is necessary for batch=1 sampling where we can't shard the batch dimension
-    params = jax.device_put(params, no_shard)
-
-    # tokenizer for Qwen2.5-VL
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=False)
-    pad_id = getattr(tokenizer, 'pad_token_id', None) or 0
-    eos_token_id = getattr(tokenizer, 'eos_token_id', None)
-    # VLM sampler and special token id for image paddings
-    vlm_sampler = VLMSampler(model, params)
-    image_pad_id = _resolve_image_pad_id(tokenizer, ckpt_dir)
-
-    # Parse env kwargs if provided
-    env_kwargs = {}
+    result_one: Optional[SampleResult] = None
+    first_token_latency: Optional[float] = None
     try:
-        raw_env_kwargs = getattr(FLAGS, 'env_kwargs', '') or ''
-        if isinstance(raw_env_kwargs, str) and len(raw_env_kwargs.strip()) > 0:
-            import json as _json
-            env_kwargs = _json.loads(raw_env_kwargs)
-            if not isinstance(env_kwargs, dict):
-                raise ValueError("--env_kwargs must be a JSON object")
-    except Exception as e:
-        print(f"Warning: failed to parse --env_kwargs: {e}")
-        env_kwargs = {}
+        cfg_one = replace(cfg, max_new_tokens=1)
+        key = rng_seq.next()
+        result_one = unified_sample(
+            model,
+            params,
+            inputs,
+            cfg_one,
+            key,
+            tokenizer=tokenizer,
+            return_logprobs=False,
+        )
+        _ensure_ready(result_one)  # warm-up compile
+        # Timed single-token decode
+        key = rng_seq.next()
+        start = time.perf_counter()
+        result_one = unified_sample(
+            model,
+            params,
+            inputs,
+            cfg_one,
+            key,
+            tokenizer=tokenizer,
+            return_logprobs=False,
+        )
+        _ensure_ready(result_one)
+        elapsed = time.perf_counter() - start
+        generated = int(result_one.tokens.shape[1]) if result_one.tokens.ndim == 2 else 0
+        if generated > 0:
+            first_token_latency = elapsed
+    except Exception:
+        first_token_latency = None
 
-    env = create_env(FLAGS.env_name, tokenizer, **env_kwargs)
-    if FLAGS.num_generation_tokens == -1:
-        FLAGS.num_generation_tokens = env.tokens_per_action
-    if FLAGS.force_answer_at == -1:
-        FLAGS.force_answer_at = env.force_answer_at
+    final_result = last_result or result_one
+    if final_result is None:
+        raise RuntimeError("JAX sampling did not produce a result.")
+    return final_result, _summaries_from_metrics(metrics), first_token_latency
 
-    # Derive optional controls
-    vlm_min_pixels = int(FLAGS.vlm_min_pixels) if int(FLAGS.vlm_min_pixels) > 0 else None
-    vlm_max_pixels = int(FLAGS.vlm_max_pixels) if int(FLAGS.vlm_max_pixels) > 0 else None
-    top_k = int(FLAGS.top_k) if int(FLAGS.top_k) > 0 else None
-    top_p = float(FLAGS.top_p) if (float(FLAGS.top_p) > 0.0 and float(FLAGS.top_p) < 1.0) else None
-    temperature = float(getattr(FLAGS, 'temperature', 1.0) or 1.0)
 
-    new_states, env_infos_history = eval_model(
-        model, params, env,
-        num_generation_tokens=FLAGS.num_generation_tokens,
-        force_answer_at=FLAGS.force_answer_at,
-        prompt_length=FLAGS.prompt_length,
-        inference_batch_per_device=FLAGS.inference_batch_per_device,
-        pad_id=pad_id,
-        shard_data_fn=shard_data_fn,
-        no_shard=no_shard,
-        data_shard=data_shard,
-        num_epochs=FLAGS.num_epochs,
-        tokenizer=tokenizer,
-        vlm_sampler=vlm_sampler,
-        image_pad_id=image_pad_id,
-        eos_token_id=eos_token_id,
-        vlm_min_pixels=vlm_min_pixels,
-        vlm_max_pixels=vlm_max_pixels,
-        top_k=top_k,
-        top_p=top_p,
-        temperature=temperature,
-        max_eval_tasks=int(getattr(FLAGS, 'max_eval_tasks', -1) or -1),
+def _benchmark_hf_text(
+    model_name: str,
+    prompt_text: str,
+    tokenizer_kwargs: Dict[str, Any],
+    max_new_tokens: int,
+    runs: int,
+    *,
+    dtype: str = "auto",
+    messages: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, float]]:
+    try:
+        import torch
+        from transformers import (
+            AutoModelForCausalLM,
+            AutoTokenizer as HFAutoTokenizer,
+            AutoProcessor,
+        )
+    except ImportError:
+        return None
+
+    try:
+        from transformers import Qwen3VLForConditionalGeneration
+    except ImportError:
+        Qwen3VLForConditionalGeneration = None  # type: ignore[assignment]
+
+    hf_tokenizer = None
+    tokenizer_error: Optional[Exception] = None
+    try:
+        hf_tokenizer = HFAutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    except Exception as exc:  # pragma: no cover - best effort fallback
+        tokenizer_error = exc
+
+    processor: Optional[Any] = None
+    try:
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    except Exception:
+        processor = None
+
+    model_dtype = dtype
+    if isinstance(dtype, str) and dtype != "auto":
+        model_dtype = getattr(torch, dtype, dtype)
+
+    # Try VLM class first before falling back to CausalLM
+    model = None
+    if Qwen3VLForConditionalGeneration is not None:
+        try:
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_name,
+                dtype=model_dtype,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+        except (ValueError, OSError):
+            model = None
+
+    if model is None:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                dtype=model_dtype,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+        except ValueError as e:
+            if "Unrecognized configuration class" in str(e):
+                print(f"Model {model_name} is not compatible with AutoModelForCausalLM or VLM classes")
+                return None
+            raise
+
+    # Prepare encoded inputs either from processor chat template or tokenizer fallback
+    batch_inputs = None
+    input_length: Optional[int] = None
+    if processor is not None and hasattr(processor, "apply_chat_template") and messages:
+        try:
+            batch_inputs = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            batch_inputs = batch_inputs.to(model.device)
+            batch_inputs = {k: v for k, v in batch_inputs.items()}
+            input_length = int(batch_inputs["input_ids"].shape[1])
+        except Exception:
+            batch_inputs = None
+            input_length = None
+
+    if batch_inputs is None:
+        if hf_tokenizer is None:
+            raise RuntimeError(
+                f"Tokenizer for model {model_name} failed to load: {tokenizer_error!s}"
+                if tokenizer_error is not None
+                else f"Tokenizer for model {model_name} is unavailable."
+            )
+        batch_inputs = hf_tokenizer(
+            prompt_text,
+            add_special_tokens=False,
+            return_tensors="pt",
+            **tokenizer_kwargs,
+        )
+        batch_inputs = batch_inputs.to(model.device)
+        batch_inputs = {k: v for k, v in batch_inputs.items()}
+        input_length = int(batch_inputs["input_ids"].shape[1])
+
+    metrics: List[Dict[str, float]] = []
+    for _ in range(max(1, runs)):
+        start = time.perf_counter()
+        outputs = model.generate(
+            **batch_inputs,
+            max_new_tokens=max_new_tokens,
+        )
+        if model.device.type == "cuda":
+            torch.cuda.synchronize(model.device)
+        elapsed = time.perf_counter() - start
+        generated = int(outputs[0].shape[0] - input_length)
+        metrics.append({"duration": elapsed, "tokens": generated})
+
+    # First token latency
+    first_token_latency: Optional[float] = None
+    try:
+        start = time.perf_counter()
+        outputs = model.generate(
+            **batch_inputs,
+            max_new_tokens=1,
+        )
+        if model.device.type == "cuda":
+            torch.cuda.synchronize(model.device)
+        elapsed = time.perf_counter() - start
+        generated = int(outputs[0].shape[0] - input_length)
+        if generated > 0:
+            first_token_latency = elapsed
+    except Exception:
+        first_token_latency = None
+
+    summary = _summaries_from_metrics(metrics)
+    if first_token_latency is not None:
+        summary["first_token_latency"] = first_token_latency
+    return summary
+
+
+def _benchmark_hf_vision(
+    model_name: str,
+    image_path: str,
+    prompt_text: str,
+    max_new_tokens: int,
+    runs: int,
+    *,
+    dtype: str = "auto",
+) -> Optional[Dict[str, float]]:
+    """Benchmark HuggingFace VLM on a multimodal image+text task."""
+    try:
+        import torch
+        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+    except ImportError:
+        return None
+
+    model_dtype = dtype
+    if isinstance(dtype, str) and dtype != "auto":
+        model_dtype = getattr(torch, dtype, dtype)
+
+    try:
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            model_name,
+            dtype=model_dtype,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    except (ValueError, OSError) as e:
+        print(f"Failed to load VLM model {model_name}: {e}")
+        return None
+
+    # Format as multimodal message
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image_path},
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+
+    # Apply chat template for multimodal input
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
     )
-    print(" ======================= Example Rollout ======================= ")
-    print(new_states[0].render())
-    print(" =============================================================== ")
-    returns = np.array(env_infos_history.get('return', []), dtype=np.float32)
-    print("Number of rollouts:", len(returns))
-    if returns.size > 0:
-        print(f"return: {float(np.mean(returns))}")
-    # Print sample responses in full (truncated)
-    responses = env_infos_history.get('response', [])
-    ground_truths = env_infos_history.get('ground_truth', [])
-    predicted_vals = env_infos_history.get('predicted', [])
-    correct_vals = env_infos_history.get('correct', [])
-    reward_weights = env_infos_history.get('reward_weights', [])
+    inputs = inputs.to(model.device)
 
-    if len(responses) > 0:
-        n = int(getattr(FLAGS, 'log_samples', 3) or 3)
-        trunc = int(getattr(FLAGS, 'log_truncate', 256) or 256)
-        print("\nSample responses:")
-        for i in range(min(n, len(responses))):
-            resp = responses[i]
-            text = resp if isinstance(resp, str) else str(resp)
-            if len(text) > trunc:
-                text = text[:trunc] + "..."
-            r = float(returns[i]) if i < len(returns) else float('nan')
+    metrics: List[Dict[str, float]] = []
+    for _ in range(max(1, runs)):
+        start = time.perf_counter()
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        if model.device.type == "cuda":
+            torch.cuda.synchronize(model.device)
+        elapsed = time.perf_counter() - start
+        generated = int(generated_ids[0].shape[0] - inputs["input_ids"].shape[1])
+        metrics.append({"duration": elapsed, "tokens": generated})
 
-            # Print response and reward
-            print(f"[{i}] reward={r:.3f}")
+    # First token latency
+    first_token_latency: Optional[float] = None
+    try:
+        start = time.perf_counter()
+        generated_ids = model.generate(**inputs, max_new_tokens=1)
+        if model.device.type == "cuda":
+            torch.cuda.synchronize(model.device)
+        elapsed = time.perf_counter() - start
+        generated = int(generated_ids[0].shape[0] - inputs["input_ids"].shape[1])
+        if generated > 0:
+            first_token_latency = elapsed
+    except Exception:
+        first_token_latency = None
 
-            # Print ground truth if available
-            if i < len(ground_truths):
-                gt = ground_truths[i]
-                if isinstance(gt, dict):
-                    print(f"  Ground truth: country={gt.get('country', 'N/A')}, "
-                          f"city={gt.get('city', 'N/A')}, "
-                          f"region={gt.get('region', 'N/A')}")
+    summary = _summaries_from_metrics(metrics)
+    if first_token_latency is not None:
+        summary["first_token_latency"] = first_token_latency
+    return summary
 
-            # Print what was extracted vs what was expected
-            if i < len(predicted_vals):
-                print(f"  Extracted: {predicted_vals[i]}")
-            if i < len(correct_vals):
-                print(f"  Expected: {correct_vals[i]}")
-            if i < len(reward_weights):
-                weights = reward_weights[i]
-                if isinstance(weights, dict):
-                    print(
-                        "  Reward weights:"
-                        f" country={weights.get('country', 'N/A')},"
-                        f" region={weights.get('region', 'N/A')},"
-                        f" city={weights.get('city', 'N/A')}"
+
+def _save_chart(plot_path: str, measurements: Dict[str, Dict[str, float]]) -> None:
+    """Persist a bar chart of mean throughput using matplotlib (if available)."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        with open(plot_path, "w", encoding="utf-8") as fh:
+            json.dump(measurements, fh, indent=2)
+        return
+
+    labels = []
+    values = []
+    for name, stats in measurements.items():
+        labels.append(name)
+        values.append(stats.get("throughput_mean", 0.0))
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.bar(labels, values, color=["#457b9d", "#e63946"])
+    ax.set_ylabel("tokens / second")
+    ax.set_title("Sampler Throughput")
+    for idx, val in enumerate(values):
+        ax.text(idx, val, f"{val:.1f}", ha="center", va="bottom")
+    plt.tight_layout()
+    fig.savefig(plot_path)
+    plt.close(fig)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Benchmark JAX sampler against Hugging Face reference.")
+    parser.add_argument("--ckpt_dir", required=True, type=str, help="Checkpoint directory produced by hf_to_jax.")
+    parser.add_argument("--prompt", type=str, default=None, help="User prompt. Required for text or vision runs.")
+    parser.add_argument("--image", type=str, default=None, help="Optional image path for VLM sampling.")
+    parser.add_argument("--max_new_tokens", type=int, default=30)
+    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--top_k", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--pad_id", type=int, default=None)
+    parser.add_argument("--benchmark_runs", type=int, default=3, help="Number of repeated runs when timing samplers.")
+    parser.add_argument("--compare_hf", action="store_true", help="Load Hugging Face PyTorch model for reference benchmarking.")
+    parser.add_argument("--hf_model_name", type=str, default="Qwen/Qwen3-4B", help="Hugging Face model id to benchmark against.")
+    parser.add_argument("--hf_dtype", type=str, default="auto", help="Torch dtype for HF model (e.g. float16, bfloat16, auto).")
+    parser.add_argument("--plot_path", type=str, default=None, help="Optional path to save throughput comparison chart (json fallback if matplotlib missing).")
+    parser.add_argument("--dump_metrics", type=str, default=None, help="Optional path to persist raw metrics as JSON.")
+    args = parser.parse_args()
+
+    # Strictly load Qwen3-VL checkpoints
+    model, params = create_model_qwen3(args.ckpt_dir)
+    tokenizer = AutoTokenizer.from_pretrained(args.ckpt_dir, trust_remote_code=False)
+    pad_id, eos_id = _resolve_pad_eos(tokenizer, model, args.pad_id)
+
+    cfg = SamplingConfig(
+        temperature=float(args.temperature),
+        top_p=(float(args.top_p) if 0.0 < float(args.top_p) < 1.0 else None),
+        top_k=(int(args.top_k) if args.top_k is not None and int(args.top_k) > 0 else None),
+        eos_id=eos_id,
+        pad_id=int(pad_id),
+        max_new_tokens=int(args.max_new_tokens),
+    )
+    rng = RngSeq(int(args.seed))
+    measurements: Dict[str, Dict[str, float]] = {}
+
+    if args.image is not None:
+        if not args.prompt:
+            raise SystemExit("Provide --prompt when sampling with an image.")
+        if model.spec.vision is None:
+            raise SystemExit("This checkpoint has no vision backbone configured.")
+
+        vision_spec = model.spec.vision
+        pixel_values, grid_thw = preprocess_image(
+            args.image,
+            patch_size=vision_spec.patch_size,
+            spatial_merge_size=vision_spec.spatial_merge_size,
+            temporal_patch_size=vision_spec.temporal_patch_size,
+        )
+        vision_embeds = model.apply({"params": params}, pixel_values, grid_thw, method=model.encode_vision)
+        num_vision_tokens = (
+            int(vision_embeds.tokens.shape[0]) if isinstance(vision_embeds, VisionEmbeddings) else int(vision_embeds.shape[0])
+        )
+        prompt_text = chat_prompt_with_image(num_vision_tokens, args.prompt)
+        input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_tokens = jnp.asarray([input_ids], dtype=jnp.int32)
+
+        image_pad_id = _resolve_image_pad_id(tokenizer, args.ckpt_dir)
+        inputs = VLMInputs(prompt_tokens=prompt_tokens, vision=vision_embeds, grid_thw=grid_thw, image_pad_id=image_pad_id)
+        result, summary, first_latency = _benchmark_jax(
+            model,
+            params,
+            inputs,
+            cfg,
+            rng,
+            tokenizer,
+            runs=int(args.benchmark_runs),
+        )
+        measurements["jax"] = {
+            **summary,
+            "first_token_latency": first_latency,
+        }
+        # Prefer extracting assistant span from full text; fall back to decoding only new tokens
+        new_tokens = result.tokens[0].tolist()
+        full_ids = input_ids + new_tokens
+        full_text = tokenizer.decode(full_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        answer = extract_assistant(full_text) or decode_tokens(tokenizer, new_tokens)
+        print(answer.strip())
+
+        if summary:
+            print(_format_summary_table("JAX sampler metrics", summary, first_latency))
+
+        if args.compare_hf:
+            hf_summary = _benchmark_hf_vision(
+                args.hf_model_name,
+                args.image,
+                args.prompt,
+                int(args.max_new_tokens),
+                int(args.benchmark_runs),
+                dtype=args.hf_dtype,
+            )
+            if hf_summary is None:
+                print("Failed to load HuggingFace VLM for multimodal comparison.")
+            else:
+                measurements["hf"] = hf_summary
+                print(
+                    _format_summary_table(
+                        f"Hugging Face ({args.hf_model_name}) metrics",
+                        hf_summary,
+                        hf_summary.get("first_token_latency", None),
                     )
+                )
 
-            print(f"  Response: {text}\n")
-    else:
-        print("No 'response' field found in env infos.")
+        if args.dump_metrics:
+            _ensure_parent_dir(args.dump_metrics)
+            with open(args.dump_metrics, "w", encoding="utf-8") as fh:
+                json.dump(measurements, fh, indent=2)
+        if args.plot_path and measurements:
+            _ensure_parent_dir(args.plot_path)
+            _save_chart(args.plot_path, measurements)
 
-    # Optional JSONL dump of all infos
-    dump_path = getattr(FLAGS, 'dump_jsonl', '') or ''
-    if isinstance(dump_path, str) and len(dump_path) > 0:
-        # align by length of the longest field
-        keys = list(env_infos_history.keys())
-        max_len = max(len(env_infos_history[k]) for k in keys)
-        with open(dump_path, 'w') as f:
-            for idx in range(max_len):
-                rec = {}
-                for k in keys:
-                    vals = env_infos_history[k]
-                    if idx < len(vals):
-                        v = vals[idx]
-                        # cast numpy types to Python types for JSON
-                        if isinstance(v, (np.generic,)):
-                            v = v.item()
-                        rec[k] = v
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        print(f"Wrote results to {dump_path}")
+        return
 
-    # Optional pdb
-    if int(getattr(FLAGS, 'debug_pdb', 0) or 0) > 0:
-        breakpoint()
+    # Text-only sampling
+    if not args.prompt:
+        raise SystemExit("Provide --prompt for text-only sampling.")
+    messages = [{"role": "user", "content": args.prompt}]
+    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+    prompt_tokens = jnp.asarray([input_ids], dtype=jnp.int32)
+
+    # Run HF comparison first if requested
+    if args.compare_hf:
+        hf_summary = _benchmark_hf_text(
+            args.hf_model_name,
+            prompt_text,
+            tokenizer_kwargs={"return_attention_mask": True},
+            max_new_tokens=int(args.max_new_tokens),
+            runs=int(args.benchmark_runs),
+            dtype=args.hf_dtype,
+            messages=messages,
+        )
+        if hf_summary is None:
+            print("Failed to import torch / transformers for HF comparison.")
+        else:
+            measurements["hf"] = hf_summary
+
+    # Then run JAX model
+    result, summary, first_latency = _benchmark_jax(
+        model,
+        params,
+        prompt_tokens,
+        cfg,
+        rng,
+        tokenizer,
+        runs=int(args.benchmark_runs),
+    )
+    measurements["jax"] = {
+        **summary,
+        "first_token_latency": first_latency,
+    }
+
+    answer = result.texts[0] if result.texts else ""
+    print(answer.strip())
+    if summary:
+        print(_format_summary_table("JAX sampler metrics", summary, first_latency))
+    if args.compare_hf and "hf" in measurements:
+        hf_summary = measurements["hf"]
+        print(
+            _format_summary_table(
+                f"Hugging Face ({args.hf_model_name}) metrics",
+                hf_summary,
+                hf_summary.get("first_token_latency", None),
+            )
+        )
+
+    if args.dump_metrics:
+        _ensure_parent_dir(args.dump_metrics)
+        with open(args.dump_metrics, "w", encoding="utf-8") as fh:
+            json.dump(measurements, fh, indent=2)
+    if args.plot_path and measurements:
+        _ensure_parent_dir(args.plot_path)
+        _save_chart(args.plot_path, measurements)
+
+
+if __name__ == "__main__":
+    main()
