@@ -1,4 +1,4 @@
-Status: Alpha - expect updates and more documentation. Inference and training run smoothly with >80gb of VRAM GPUs currently with Qwen3-VL-4B-Instruct as the default model.
+Status: Alpha - PPO support only, expect GRPO support and more documentation. Inference runs smoothly, however training runs currently memoryconstrained to low batch sizes with >80gb of VRAM GPUs. Qwen3-VL-4B-Instruct as the default model.
 
 <img width="325" height="240" alt="vlmgym" src="https://github.com/user-attachments/assets/87d7d141-4464-4687-91c0-3a6da82b2749" />
 
@@ -15,6 +15,12 @@ A simple reinforcement learning gym for vision-language models, written in JAX. 
 
 ---
 
+**Install and convert HF(Qwen3-VL-4B-Instruct default model) → JAX**
+```bash
+uv sync 
+uv run python -m utils.hf_to_jax --model_dir checkpoints/qwen3vl_4b
+```
+
 ## Run a VLM to play GeoGuessr
 
 ```bash
@@ -25,7 +31,14 @@ uv run python -m core.rollout
 
 ## Train a VLM to play GeoGuessr
 
-the reward is shaped to improve accuracy on countries, region, cities in that order blended with coordinate depending on the schedule.
+Training uses a hierarchical curriculum that progressively sharpens geolocation accuracy:
+- **Stage 1 (0-100 episodes)**: Country-level coarse matching (wide tolerance)
+- **Stage 2 (100-300)**: Country refinement (tighter kernels)
+- **Stage 3 (300-600)**: Add region signal
+- **Stage 4 (600-1000)**: Introduce city-level precision
+- **Stage 5 (1000+)**: Full hierarchical task (country + region + city + coords)
+
+Each field (country/region/city/coords) uses geodesic distance with exponential decay kernels. Weights blend progressively to guide learning from coarse → fine localization.
 
 ```bash
 # Train on OpenStreetView-5M dataset
@@ -36,16 +49,6 @@ uv run python core/train.py \
   --total_steps 10000
 ```
 ---
-
-**Install**
-```bash
-uv sync
-```
-
-**Convert HF → JAX** (defaults to Qwen/Qwen3-VL-4B-Instruct)
-```bash
-uv run python -m utils.hf_to_jax --model_dir checkpoints/qwen3vl_4b
-```
 
 **Sample**
 ```bash
@@ -86,13 +89,14 @@ uv run python core/eval.py \
 
 Currently the JAX compiler takes a while to run its initial compile, yet the rest of the inference is slightly behind the Hugging Face baseline. TODO: optimize the JAX sampler to improve throughput.
 
-Results:
+**Preliminary Benchmarks** (Qwen3-VL-4B, A100 80GB, Oct 2024):
 | Metric | JAX Sampler | HF Baseline |
 | --- | --- | --- |
 | Mean tokens/sec | 12.73 ± 0.06 | 16.79 ± 3.03 |
 | First-token latency (s) | 28.19 | 0.16 |
-| Steady-state duration (s) | 40.02 | 0.81 |
 | Steady-state throughput (tok/s) | 12.79 | 19.82 |
+
+_First-token latency includes XLA compile time. Reproduce with `core/eval.py --compare_hf --benchmark_runs 2`._
 
 ---
 
@@ -112,7 +116,7 @@ class MyEnv(BaseEnv):
 ```
 
 **Built-in environments:**
-- `osv5m` — **GeoGuessr**: Street-view geolocation with hierarchical rewards (country→region→city→coords)
+- `geospot` — **GeoGuessr**: Street-view geolocation with hierarchical rewards (country→region→city→coords)
 - `nlvr2` — Two-image True/False reasoning
 
 ---
@@ -120,7 +124,7 @@ class MyEnv(BaseEnv):
 ## Requirements
 
 - Python 3.10+
-- Linux, CUDA 12, NVIDIA GPU (~60GB VRAM for 7B)
+- Linux, CUDA 12, NVIDIA GPU (80GB+ recommended for training; inference requires ~10GB for 4B model)
 - JAX 0.6.1 (CUDA 12 build)
 
 ---
@@ -130,6 +134,21 @@ class MyEnv(BaseEnv):
 - **lmpo** — [kvfrans/lmpo](https://github.com/kvfrans/lmpo)
 - **Qwen model base** — [jax-ml/jax-llm-examples](https://github.com/jax-ml/jax-llm-examples/tree/main/qwen3)
 - **NLVR2 dataset** — [HuggingFaceM4/NLVR2](https://huggingface.co/datasets/HuggingFaceM4/NLVR2)
+
+---
+
+## Citation
+
+If you use vlm-gym in your research, please cite:
+
+```bibtex
+@software{dantuluri2025vlmgym,
+  author = {Dantuluri, Surya},
+  title = {vlm-gym: Reinforcement Learning Gym for Vision-Language Models},
+  year = {2024},
+  url = {https://github.com/sdan/vlm-gym}
+}
+```
 
 ---
 
