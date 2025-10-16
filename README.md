@@ -6,8 +6,10 @@ Status: Alpha - PPO support only, expect GRPO support and more documentation. In
 
 A simple reinforcement learning gym for vision-language models, written in JAX. Drop in any environment, any model, and train with PPO.
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/sdan/vlm-gym/blob/low-mem-gpu/colab_setup.ipynb)
+
 **Core components:**
-- `envs/` — Pluggable vision environments (GeoGuessr, NLVR2, captioning)
+- `envs/` — Pluggable vision environments (GeoGauessr, NLVR2, captioning)
 - `models/` — VLM implementations (Qwen3-VL-4B-Instruct reference)
 - `core/train.py` — Trainer runs PPO on the environment
 - `core/rollout.py` — Inference engine runs the VLM on the environment

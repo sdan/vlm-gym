@@ -50,6 +50,10 @@ def install_dependencies():
     run("uv venv .venv --python 3.10")
     run("uv pip install -e .")
 
+    # Install JAX TPU version
+    print("Installing JAX TPU version...")
+    run("uv pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html")
+
 
 def configure_tpu():
     """Configure JAX for TPU runtime."""
@@ -69,15 +73,16 @@ def configure_tpu():
 
 
 def download_checkpoint():
-    """Download or verify Qwen3-VL checkpoint."""
+    """Download pre-converted Qwen3-VL checkpoint from GCS."""
     ckpt_dir = Path("checkpoints/qwen3vl_4b")
     if ckpt_dir.exists():
         print(f"✓ Checkpoint exists: {ckpt_dir}")
         return
 
-    print("Checkpoint not found. You'll need to run conversion:")
-    print("  python scripts/hf_to_jax.py --model_name Qwen/Qwen2-VL-2B-Instruct --output_dir checkpoints/qwen3vl_4b")
-    print("\nFor quick testing, using a smaller model is recommended.")
+    print("Downloading checkpoint from gs://geospot/checkpoints/qwen3vl_4b...")
+    run("mkdir -p checkpoints")
+    run("gsutil -m cp -r gs://geospot/checkpoints/qwen3vl_4b checkpoints/")
+    print(f"✓ Checkpoint downloaded to {ckpt_dir}")
 
 
 def run_training():
