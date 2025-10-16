@@ -97,6 +97,10 @@ config = ml_collections.ConfigDict({
     "weight_decay": 1e-2,
     "max_grad_norm": 1.0,
     "use_ema": 0,
+    # Low-memory mode: tunes defaults for constrained accelerators (e.g., Colab TPU).
+    # Applies conservative overrides for memory: bf16 params, Adafactor, small PPO minibatch,
+    # stricter vision pixel cap, skip DeepStack staging.
+    "low_memory": 0,
 })
 define_flag_dict(config)
 FLAGS = flags.FLAGS
@@ -234,6 +238,32 @@ def _make_optimizer() -> optax.GradientTransformation:
     return optax.chain(*chain)
 
 
+def _cast_params_bf16_except_lm_head(params):
+    """Cast parameter pytree to bf16 except keep lm_head/kernel in fp32 for logits stability."""
+    try:
+        from flax.core import unfreeze, freeze
+    except Exception:
+        return params
+
+    pf = unfreeze(params)
+
+    def _recurse(obj, path=()):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                obj[k] = _recurse(v, path + (k,))
+            return obj
+        try:
+            # Arrays (JAX/NumPy)
+            if len(path) >= 2 and path[-2] == "lm_head" and path[-1] == "kernel":
+                return jnp.asarray(obj, dtype=jnp.float32)
+            return jnp.asarray(obj, dtype=jnp.bfloat16)
+        except Exception:
+            return obj
+
+    pf = _recurse(pf)
+    return freeze(pf)
+
+
 def _build_env(tokenizer):
     name = str(FLAGS.env_name or "").lower()
     max_samples = int(getattr(FLAGS, "env_max_samples", -1) or -1)
@@ -322,9 +352,52 @@ def _maybe_save(train_state: TrainState, save_dir: str, step: int) -> None:
 def main(_):
     FLAGS(sys.argv)
 
+    # Apply low-memory overrides early so downstream config picks them up.
+    low_mem = bool(int(getattr(FLAGS, "low_memory", 0) or 0) == 1)
+    if low_mem:
+        # Skip staging DeepStack feature copies in training batches.
+        os.environ["VLMRL_SKIP_DEEPSTACK"] = "1"
+        # Prefer Adafactor for optimizer state efficiency.
+        try:
+            FLAGS.optimizer = "adafactor"
+        except Exception:
+            pass
+        # Cap pixels to reduce sequence length (tokens) and activation size.
+        try:
+            if int(getattr(FLAGS, "vlm_max_pixels", -1) or -1) <= 0 or int(FLAGS.vlm_max_pixels) > 120_000:
+                FLAGS.vlm_max_pixels = 120_000
+        except Exception:
+            pass
+        # Keep PPO microbatch small to trim logits memory.
+        try:
+            if int(getattr(FLAGS, "ppo_minibatch", 64) or 64) > 4:
+                FLAGS.ppo_minibatch = 2
+        except Exception:
+            pass
+        # Collection batch can also be trimmed on small-memory devices.
+        try:
+            if int(getattr(FLAGS, "batch_size", 16) or 16) > 8:
+                FLAGS.batch_size = 8
+        except Exception:
+            pass
+        # Avoid entropy compute by default; rely on sampling + KL for exploration.
+        try:
+            FLAGS.entropy_coef = 0.0
+        except Exception:
+            pass
+
     if jax.process_index() == 0:
         print(f"[train] Loading model from {FLAGS.model_dir}")
     model, params = create_model_from_ckpt(FLAGS.model_dir)
+    # Cast params to bf16 in low-memory mode to halve footprint (keep lm_head/kernel fp32).
+    if low_mem:
+        try:
+            params = _cast_params_bf16_except_lm_head(params)
+            if jax.process_index() == 0:
+                print("[train] low_memory=1: cast parameters to bfloat16 (lm_head in fp32)")
+        except Exception as exc:
+            if jax.process_index() == 0:
+                print(f"[train] bf16 cast skipped due to: {exc}")
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.model_dir, trust_remote_code=False)
     pad_id, eos_id = _resolve_pad_and_eos(tokenizer, model)
     image_pad_id = _resolve_image_pad_id(tokenizer, FLAGS.model_dir)

@@ -15,6 +15,9 @@ from typing import Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from functools import partial
+import flax.jax_utils as jax_utils
 from transformers import AutoTokenizer
 
 from vlmrl.core.types import SamplingConfig, Rollout, Batch
@@ -116,18 +119,18 @@ def update(
         std = advantages.std()
         advantages = jnp.where(std > 1e-8, advantages / std, advantages)
 
-    # One-step jit loss-apply function
+    # One-step jit loss-apply function (single-device)
     @jax.jit
-    def _ppo_step(ts: TrainState,
-                  tokens: jnp.ndarray,
-                  mask_targets: jnp.ndarray,
-                  adv: jnp.ndarray,
-                  oldlp: jnp.ndarray,
-                  vision: Union[jnp.ndarray, VisionEmbeddings],
-                  token_mask: jnp.ndarray,
-                  cos: jnp.ndarray,
-                  sin: jnp.ndarray,
-                  kl_coef_val: float) -> Tuple[TrainState, dict]:
+    def _ppo_step_single(ts: TrainState,
+                         tokens: jnp.ndarray,
+                         mask_targets: jnp.ndarray,
+                         adv: jnp.ndarray,
+                         oldlp: jnp.ndarray,
+                         vision: Union[jnp.ndarray, VisionEmbeddings],
+                         token_mask: jnp.ndarray,
+                         cos: jnp.ndarray,
+                         sin: jnp.ndarray,
+                         kl_coef_val: float) -> Tuple[TrainState, dict]:
         text_target = tokens[:, 1:]
 
         def loss_fn(p):
@@ -145,9 +148,21 @@ def update(
                     method=ts.model_def.forward_vlm,
                 )
             logits, _ = call_with_params(p)
-            all_logprobs = jax.nn.log_softmax(logits, axis=-1)
-            token_logprobs = jnp.sum(all_logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
-            entropy = -jnp.sum(jax.nn.softmax(logits, axis=-1) * all_logprobs, axis=-1)
+            # Memory-lean target logprob: gather target logits then subtract logsumexp.
+            # Avoids materializing [B,T,V] one-hot and full log_softmax tensor.
+            target_logits = jnp.take_along_axis(
+                logits, text_target[..., None], axis=-1
+            ).squeeze(-1)
+            lse = jax.nn.logsumexp(logits, axis=-1)
+            token_logprobs = target_logits - lse
+
+            # Entropy: compute only when coefficient is non-zero to save memory.
+            if float(entropy_coef) != 0.0:
+                all_logprobs = jax.nn.log_softmax(logits, axis=-1)
+                probs = jax.nn.softmax(logits, axis=-1)
+                entropy = -jnp.sum(probs * all_logprobs, axis=-1)
+            else:
+                entropy = jnp.zeros_like(token_logprobs)
 
             logratio = token_logprobs - oldlp
             ratio = jnp.exp(logratio)
@@ -184,74 +199,255 @@ def update(
         metrics = {**metrics, 'grad_norm': jnp.asarray(jax.tree_util.tree_reduce(lambda a, b: a + jnp.sum(b*b), grads, 0.0))}
         return new_state, metrics
 
-    # Training loop over epochs and contiguous minibatches
-    N = int(tokens_all.shape[0])
-    mb = int(minibatch_size)
-    chunks = max(1, N // max(1, mb))
-    n_use = chunks * mb
-    if n_use == 0:
-        return train_state, {'skipped': 1.0}
+    # One-step pmapped loss-apply function (multi-device)
+    @partial(jax.pmap, axis_name='data')
+    def _ppo_step_pmap(ts: TrainState,
+                       tokens: jnp.ndarray,
+                       mask_targets: jnp.ndarray,
+                       adv: jnp.ndarray,
+                       oldlp: jnp.ndarray,
+                       vision: Union[jnp.ndarray, VisionEmbeddings],
+                       token_mask: jnp.ndarray,
+                       cos: jnp.ndarray,
+                       sin: jnp.ndarray,
+                       kl_coef_val: float) -> Tuple[TrainState, dict]:
+        text_target = tokens[:, 1:]
 
-    # Pre-slice tensors common to all minibatches
-    tokens_all = tokens_all[:n_use]
-    mask_targets_all = mask_targets_all[:n_use]
-    oldlp_all = oldlp_all[:n_use]
-    adv_all = advantages[:n_use]
-    token_mask_all = batch.token_mask[:n_use]
-    cos_all = batch.cos[:, :n_use, : tokens_all.shape[1] - 1]
-    sin_all = batch.sin[:, :n_use, : tokens_all.shape[1] - 1]
-    if isinstance(batch.vision, VisionEmbeddings):
-        v_tokens = batch.vision.tokens[:n_use]
-        v_deep = batch.vision.deepstack
-        v_deep = tuple(ds[:n_use] for ds in v_deep) if v_deep else ()
-    else:
-        v_tokens = batch.vision[:n_use]
-        v_deep = ()
+        def loss_fn(p):
+            def call_with_params(params):
+                return ts.call_model(
+                    tokens[:, :-1],
+                    vision,
+                    image_pad_id,
+                    cos,
+                    sin,
+                    mask=token_mask,
+                    cache=None,
+                    params=params,
+                    method=ts.model_def.forward_vlm,
+                )
+            logits, _ = call_with_params(p)
+            target_logits = jnp.take_along_axis(
+                logits, text_target[..., None], axis=-1
+            ).squeeze(-1)
+            lse = jax.nn.logsumexp(logits, axis=-1)
+            token_logprobs = target_logits - lse
 
-    metrics_accum = {}
-    state = train_state
-    coef = float(kl_coef)
-    for _ in range(int(num_epochs)):
-        for i in range(chunks):
-            start = i * mb
-            end = (i + 1) * mb
-            sl = slice(start, end)
-            if v_deep:
-                v_mb = VisionEmbeddings(tokens=v_tokens[sl], deepstack=tuple(ds[sl] for ds in v_deep))
+            if float(entropy_coef) != 0.0:
+                all_logprobs = jax.nn.log_softmax(logits, axis=-1)
+                probs = jax.nn.softmax(logits, axis=-1)
+                entropy = -jnp.sum(probs * all_logprobs, axis=-1)
             else:
-                v_mb = v_tokens[sl]
-            state, m = _ppo_step(
-                state,
-                tokens_all[sl],
-                mask_targets_all[sl, : tokens_all.shape[1] - 1],
-                adv_all[sl],
-                oldlp_all[sl, : tokens_all.shape[1] - 1],
-                v_mb,
-                token_mask_all[sl],
-                cos_all[:, start:end],
-                sin_all[:, start:end],
-                coef,
-            )
+                entropy = jnp.zeros_like(token_logprobs)
 
-            # Adaptive KL if provided
-            if kl_ctrl is not None:
-                try:
-                    approx_kl_val = float(jax.device_get(m.get('approx_kl', 0.0)))
-                except Exception:
-                    approx_kl_val = 0.0
-                coef = kl_ctrl.update(approx_kl_val, coef)
+            logratio = token_logprobs - oldlp
+            ratio = jnp.exp(logratio)
+            pg1 = -adv[:, None] * ratio
+            pg2 = -adv[:, None] * jnp.clip(ratio, 1 - clip_epsilon, 1 + clip_epsilon)
+            pg = jnp.maximum(pg1, pg2)
 
-            # Accumulate metrics
-            m_host = jax.tree_util.tree_map(lambda x: float(jax.device_get(x)), m)
-            for k, v in m_host.items():
-                metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+            mask = mask_targets
+            denom = jnp.sum(mask) + 1e-8
+            loss_pg = jnp.sum(pg * mask) / denom
+            loss_ent = -jnp.asarray(entropy_coef, dtype=jnp.float32) * jnp.sum(entropy * mask) / denom
+            kl_term = jnp.sum((oldlp - token_logprobs) * mask) / denom
+            loss_kl = jnp.asarray(kl_coef_val, dtype=jnp.float32) * kl_term
+            loss = loss_pg + loss_ent + loss_kl
 
-    # Average over total minibatches processed
-    total_mb = chunks * int(num_epochs)
-    for k in list(metrics_accum.keys()):
-        metrics_accum[k] /= max(1, total_mb)
-    metrics_accum['kl_coef'] = float(coef)
-    return state, metrics_accum
+            approx_kl = jnp.sum(((ratio - 1.0) - logratio) * mask) / denom
+            clip_fraction = jnp.sum((jnp.abs(ratio - 1.0) > clip_epsilon) * mask) / denom
+            metrics = {
+                'loss': loss,
+                'loss_pg': loss_pg,
+                'loss_ent': loss_ent,
+                'loss_kl': loss_kl,
+                'entropy': jnp.sum(entropy * mask) / denom,
+                'approx_kl': approx_kl,
+                'clip_fraction': clip_fraction,
+                'token_logprob_mean': jnp.sum(token_logprobs * mask) / denom,
+            }
+            return loss, metrics
+
+        (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(ts.params)
+        # Average grads and metrics across devices
+        grads = jax.lax.pmean(grads, axis_name='data')
+        metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name='data'), metrics)
+        updates, opt_state = ts.tx.update(grads, ts.opt_state, ts.params)
+        new_params = jax.tree_util.tree_map(lambda p, u: p + u, ts.params, updates)
+        new_state = ts.replace(params=new_params, opt_state=opt_state, step=ts.step + 1)
+        grad_norm = jnp.asarray(jax.tree_util.tree_reduce(lambda a, b: a + jnp.sum(b*b), grads, 0.0))
+        metrics = {**metrics, 'grad_norm': grad_norm}
+        return new_state, metrics
+
+    # Training loop: pick multi-device or single-device path
+    n_dev = int(jax.local_device_count())
+    use_pmap = (n_dev > 1) and (int(minibatch_size) >= n_dev)
+
+    if use_pmap:
+        # pmap path: replicate state and shard minibatches across devices
+        N = int(tokens_all.shape[0])
+        mb = int(minibatch_size)
+        per = mb // n_dev
+        eff_mb = per * n_dev
+        chunks = max(1, N // max(1, eff_mb))
+        n_use = chunks * eff_mb
+        if n_use == 0:
+            return train_state, {'skipped': 1.0}
+
+        # Pre-slice tensors common to all minibatches
+        tokens_all_p = tokens_all[:n_use]
+        mask_targets_all_p = mask_targets_all[:n_use]
+        oldlp_all_p = oldlp_all[:n_use]
+        adv_all_p = advantages[:n_use]
+        token_mask_all_p = batch.token_mask[:n_use]
+        Tm1 = int(tokens_all.shape[1] - 1)
+        cos_all_p = batch.cos[:, :n_use, : Tm1]
+        sin_all_p = batch.sin[:, :n_use, : Tm1]
+        if isinstance(batch.vision, VisionEmbeddings):
+            v_tokens_all = batch.vision.tokens[:n_use]
+            v_deep_all = batch.vision.deepstack
+            v_deep_all = tuple(ds[:n_use] for ds in v_deep_all) if v_deep_all else ()
+        else:
+            v_tokens_all = batch.vision[:n_use]
+            v_deep_all = ()
+
+        metrics_accum = {}
+        state_rep = jax_utils.replicate(train_state)
+        coef = float(kl_coef)
+        for _ in range(int(num_epochs)):
+            for i in range(chunks):
+                start = i * eff_mb
+                end = (i + 1) * eff_mb
+                sl = slice(start, end)
+
+                # Reshape per-device
+                tokens_mb = tokens_all_p[sl].reshape(n_dev, per, *tokens_all_p.shape[1:])
+                mask_targets_mb = mask_targets_all_p[sl, :Tm1].reshape(n_dev, per, Tm1)
+                adv_mb = adv_all_p[sl].reshape(n_dev, per)
+                oldlp_mb = oldlp_all_p[sl, :Tm1].reshape(n_dev, per, Tm1)
+                token_mask_mb = token_mask_all_p[sl, :Tm1].reshape(n_dev, per, Tm1)
+
+                # cos/sin: [R, eff_mb, L] -> [n_dev, R, per, L]
+                cos_mb = cos_all_p[:, start:end]
+                sin_mb = sin_all_p[:, start:end]
+                R = int(cos_mb.shape[0])
+                L = int(cos_mb.shape[-1])
+                cos_mb = cos_mb.reshape(R, n_dev, per, L).transpose(1, 0, 2, 3)
+                sin_mb = sin_mb.reshape(R, n_dev, per, L).transpose(1, 0, 2, 3)
+
+                # Vision
+                if v_deep_all:
+                    v_tokens_mb = v_tokens_all[sl].reshape(n_dev, per, *v_tokens_all.shape[1:])
+                    v_deep_mb = tuple(ds[sl].reshape(n_dev, per, *ds.shape[1:]) for ds in v_deep_all)
+                    v_mb = VisionEmbeddings(tokens=v_tokens_mb, deepstack=v_deep_mb)
+                else:
+                    v_mb = v_tokens_all[sl].reshape(n_dev, per, *v_tokens_all.shape[1:])
+
+                state_rep, m = _ppo_step_pmap(
+                    state_rep,
+                    tokens_mb,
+                    mask_targets_mb,
+                    adv_mb,
+                    oldlp_mb,
+                    v_mb,
+                    token_mask_mb,
+                    cos_mb,
+                    sin_mb,
+                    coef,
+                )
+
+                # Adaptive KL if provided
+                if kl_ctrl is not None:
+                    try:
+                        m_unrep = jax_utils.unreplicate(m)
+                        approx_kl_val = float(jax.device_get(m_unrep.get('approx_kl', 0.0)))
+                    except Exception:
+                        approx_kl_val = 0.0
+                    coef = kl_ctrl.update(approx_kl_val, coef)
+
+                # Accumulate metrics (unreplicate to host scalar)
+                m_unrep = jax_utils.unreplicate(m)
+                m_host = jax.tree_util.tree_map(lambda x: float(jax.device_get(x)), m_unrep)
+                for k, v in m_host.items():
+                    metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+
+        # Average over total minibatches processed
+        total_mb = max(1, chunks * int(num_epochs))
+        for k in list(metrics_accum.keys()):
+            metrics_accum[k] /= max(1, total_mb)
+        metrics_accum['kl_coef'] = float(coef)
+        state_single = jax_utils.unreplicate(state_rep)
+        return state_single, metrics_accum
+
+    else:
+        # Single-device path (original)
+        N = int(tokens_all.shape[0])
+        mb = int(minibatch_size)
+        chunks = max(1, N // max(1, mb))
+        n_use = chunks * mb
+        if n_use == 0:
+            return train_state, {'skipped': 1.0}
+
+        # Pre-slice tensors common to all minibatches
+        tokens_all = tokens_all[:n_use]
+        mask_targets_all = mask_targets_all[:n_use]
+        oldlp_all = oldlp_all[:n_use]
+        adv_all = advantages[:n_use]
+        token_mask_all = batch.token_mask[:n_use]
+        cos_all = batch.cos[:, :n_use, : tokens_all.shape[1] - 1]
+        sin_all = batch.sin[:, :n_use, : tokens_all.shape[1] - 1]
+        if isinstance(batch.vision, VisionEmbeddings):
+            v_tokens = batch.vision.tokens[:n_use]
+            v_deep = batch.vision.deepstack
+            v_deep = tuple(ds[:n_use] for ds in v_deep) if v_deep else ()
+        else:
+            v_tokens = batch.vision[:n_use]
+            v_deep = ()
+
+        metrics_accum = {}
+        state = train_state
+        coef = float(kl_coef)
+        for _ in range(int(num_epochs)):
+            for i in range(chunks):
+                start = i * mb
+                end = (i + 1) * mb
+                sl = slice(start, end)
+                if v_deep:
+                    v_mb = VisionEmbeddings(tokens=v_tokens[sl], deepstack=tuple(ds[sl] for ds in v_deep))
+                else:
+                    v_mb = v_tokens[sl]
+                state, m = _ppo_step_single(
+                    state,
+                    tokens_all[sl],
+                    mask_targets_all[sl, : tokens_all.shape[1] - 1],
+                    adv_all[sl],
+                    oldlp_all[sl, : tokens_all.shape[1] - 1],
+                    v_mb,
+                    token_mask_all[sl],
+                    cos_all[:, start:end],
+                    sin_all[:, start:end],
+                    coef,
+                )
+
+                # Adaptive KL if provided
+                if kl_ctrl is not None:
+                    try:
+                        approx_kl_val = float(jax.device_get(m.get('approx_kl', 0.0)))
+                    except Exception:
+                        approx_kl_val = 0.0
+                    coef = kl_ctrl.update(approx_kl_val, coef)
+
+                # Accumulate metrics
+                m_host = jax.tree_util.tree_map(lambda x: float(jax.device_get(x)), m)
+                for k, v in m_host.items():
+                    metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+
+        # Average over total minibatches processed
+        total_mb = chunks * int(num_epochs)
+        for k in list(metrics_accum.keys()):
+            metrics_accum[k] /= max(1, total_mb)
+        metrics_accum['kl_coef'] = float(coef)
+        return state, metrics_accum
 
 
 __all__ = ["TrainerConfig", "collect", "update"]
