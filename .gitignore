@@ -3,6 +3,8 @@ scripts/
 runs/
 notebooks/
 checkpoints/
+.uv_cache/
+.claude/
 viz/manim/*.mp4
 viz/manim/*.txt
 viz/manim/*.md
