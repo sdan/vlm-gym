@@ -530,20 +530,40 @@ class MultiHeadAttention(nn.Module):
             q_grouped = q.reshape(batch, self.num_kv_heads, repeats, q.shape[2], self.head_dim)
             # k stays as (batch, kv_heads, k_len, dim) - no need to expand yet
             
-            # Compute attention scores with einsum that handles the broadcasting
-            attn_scores = jnp.einsum(
-                "bhgqd,bhkd->bhgqk",
-                q_grouped.astype(jnp.float32),
-                k.astype(jnp.float32),
+            # Compute attention scores using batched matmul on flattened (B*Hkv*G) to
+            # avoid multi-dimension contractions that METAL struggles to legalize.
+            qg = q_grouped.astype(jnp.float32)  # [B, Hkv, G, Q, D]
+            kf = k.astype(jnp.float32)          # [B, Hkv, K, D]
+            B, Hkv, G, Q, D = qg.shape
+            K = kf.shape[2]
+            q2 = qg.reshape(B * Hkv * G, Q, D)
+            k2 = kf.reshape(B * Hkv, K, D)
+            # Repeat keys across the grouped-repeat dimension
+            k2 = jnp.repeat(k2, repeats=G, axis=0)  # [B*Hkv*G, K, D]
+            # scores: [B*Hkv*G, Q, K]
+            attn_scores = jax.lax.dot_general(
+                q2,
+                jnp.swapaxes(k2, -1, -2),
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                precision=jax.lax.Precision.HIGHEST,
             ) * (self.head_dim ** -0.5)
-            # Reshape back to (batch, num_heads, q_len, k_len)
-            attn_scores = attn_scores.reshape(batch, self.num_heads, q.shape[2], k.shape[2])
+            # Reshape back to (B, H, Q, K)
+            attn_scores = attn_scores.reshape(B, Hkv, G, Q, K).reshape(batch, self.num_heads, q.shape[2], k.shape[2])
         else:
-            attn_scores = jnp.einsum(
-                "bhqd,bhkd->bhqk",
-                q.astype(jnp.float32),
-                k.astype(jnp.float32),
+            # Non-grouped case: use batched matmul over (B*H)
+            qf = q.astype(jnp.float32)  # [B, H, Q, D]
+            kf = k.astype(jnp.float32)  # [B, H, K, D]
+            B, H, Q, D = qf.shape
+            K = kf.shape[2]
+            q2 = qf.reshape(B * H, Q, D)
+            k2 = kf.reshape(B * H, K, D)
+            attn_scores = jax.lax.dot_general(
+                q2,
+                jnp.swapaxes(k2, -1, -2),
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                precision=jax.lax.Precision.HIGHEST,
             ) * (self.head_dim ** -0.5)
+            attn_scores = attn_scores.reshape(B, H, Q, K)
         attn_scores = attn_scores + (1.0 - history_mask)[:, None, None, :].astype(jnp.float32) * -1e9  # mask pad
         q_len = attn_scores.shape[2]
         if q_len > 1:
@@ -556,21 +576,37 @@ class MultiHeadAttention(nn.Module):
         if self.num_heads != self.num_kv_heads:
             repeats = self.num_heads // self.num_kv_heads
             # Reshape weights for grouped computation
-            attn_weights_grouped = attn_weights.reshape(batch, self.num_kv_heads, repeats, q_len, -1)
-            # Compute output with einsum that handles the broadcasting
-            attn_output = jnp.einsum(
-                "bhgqk,bhkd->bhgqd",
-                attn_weights_grouped,
-                v.astype(jnp.float32),
+            AWg = attn_weights.reshape(batch, self.num_kv_heads, repeats, q_len, -1)  # [B,Hkv,G,Q,K]
+            vf = v.astype(jnp.float32)  # [B, Hkv, K, D]
+            B, Hkv, G, Q, K = AWg.shape
+            D = vf.shape[-1]
+            AW2 = AWg.reshape(B * Hkv * G, Q, K)
+            v2 = vf.reshape(B * Hkv, K, D)
+            v2 = jnp.repeat(v2, repeats=G, axis=0)  # [B*Hkv*G, K, D]
+            # out2: [B*Hkv*G, Q, D]
+            out2 = jax.lax.dot_general(
+                AW2,
+                v2,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                precision=jax.lax.Precision.HIGHEST,
             )
-            # Reshape back to (batch, num_heads, q_len, head_dim)
-            attn_output = attn_output.reshape(batch, self.num_heads, q_len, self.head_dim).astype(self.dtype)
+            # Reshape back to (B, H, Q, D)
+            attn_output = out2.reshape(B, Hkv, G, Q, D).reshape(batch, self.num_heads, q_len, self.head_dim).astype(self.dtype)
         else:
-            attn_output = jnp.einsum(
-                "bhqk,bhkd->bhqd",
-                attn_weights,
-                v.astype(jnp.float32),
-            ).astype(self.dtype)
+            # Non-grouped case: (B*H) batched matmul
+            AW = attn_weights  # [B, H, Q, K]
+            vf = v.astype(jnp.float32)  # [B, H, K, D]
+            B, H, Q, K = AW.shape
+            D = vf.shape[-1]
+            AW2 = AW.reshape(B * H, Q, K)
+            v2 = vf.reshape(B * H, K, D)
+            out2 = jax.lax.dot_general(
+                AW2,
+                v2,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                precision=jax.lax.Precision.HIGHEST,
+            )
+            attn_output = out2.reshape(B, H, Q, D).astype(self.dtype)
         attn_output = jnp.transpose(attn_output, (0, 2, 1, 3)).reshape(batch, seqlen, -1)
         out = nn.Dense(self.hidden_size, use_bias=False, dtype=self.dtype, name="o_proj")(
             attn_output
@@ -1094,10 +1130,14 @@ def _torch_key_to_flax(key: str) -> Optional[str]:
     return None
 
 
-def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
+def create_model_from_hf(hf_dir: str, dtype: Optional[str] = None) -> tuple[Qwen3VLModel, dict[str, Any]]:
     cfg = _load_hf_config(hf_dir)
     spec = spec_from_config(cfg)
-    model = Qwen3VLModel(spec)
+    if dtype is not None:
+        dtype_map = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "bf16": jnp.bfloat16, "fp32": jnp.float32}
+        model = Qwen3VLModel(spec, dtype=dtype_map.get(str(dtype).lower(), jnp.bfloat16))
+    else:
+        model = Qwen3VLModel(spec)
 
     dummy_ids = jnp.zeros((1, 1), dtype=jnp.int32)
     rope_axes = len(tuple(int(x) for x in spec.text.rope_section))
@@ -1176,12 +1216,16 @@ def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
     return model, flax.core.freeze(param_dict)
 
 
-def create_model_from_ckpt(ckpt_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
+def create_model_from_ckpt(ckpt_dir: str, dtype: Optional[str] = None) -> tuple[Qwen3VLModel, dict[str, Any]]:
     from vlmrl.utils.checkpoint import Checkpoint
 
     cfg = _load_hf_config(ckpt_dir)
     spec = spec_from_config(cfg)
-    model = Qwen3VLModel(spec)
+    if dtype is not None:
+        dtype_map = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "bf16": jnp.bfloat16, "fp32": jnp.float32}
+        model = Qwen3VLModel(spec, dtype=dtype_map.get(str(dtype).lower(), jnp.bfloat16))
+    else:
+        model = Qwen3VLModel(spec)
     ckpt = Checkpoint(f"{ckpt_dir}/params.pkl", parallel=False)
     params = ckpt.load_as_dict()["params"]
     return model, params

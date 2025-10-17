@@ -98,12 +98,14 @@ class VisionAttention(nn.Module):
                 "hqd,hkd->hqk",
                 q_chunk.astype(jnp.float32),
                 k_chunk.astype(jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
             ) * self.scale
             attn_weights = jax.nn.softmax(attn_scores, axis=-1)
             attn_out = jnp.einsum(
                 "hqk,hkd->hqd",
                 attn_weights,
                 v_chunk.astype(jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
             ).astype(self.dtype)
 
             attn_out = jnp.transpose(attn_out, (1, 0, 2))
