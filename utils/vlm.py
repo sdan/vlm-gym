@@ -207,9 +207,21 @@ def apply_top_p_logits(logits: jnp.ndarray, top_p: Optional[float]) -> jnp.ndarr
     full sort over the vocab each step.
     """
     if top_p is None or not (0.0 < float(top_p) < 1.0):
-        return logits
-    sorted_indices = jnp.argsort(logits, axis=-1)[:, ::-1]
-    sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
+        return jnp.nan_to_num(
+            logits,
+            nan=jnp.float32(-1e9),
+            neginf=jnp.float32(-1e9),
+            posinf=jnp.float32(-1e9),
+        )
+    # Clamp NaN/Inf to avoid undefined categorical behavior on some backends
+    safe_logits = jnp.nan_to_num(
+        logits,
+        nan=jnp.float32(-1e9),
+        neginf=jnp.float32(-1e9),
+        posinf=jnp.float32(-1e9),
+    )
+    sorted_indices = jnp.argsort(safe_logits, axis=-1)[:, ::-1]
+    sorted_logits = jnp.take_along_axis(safe_logits, sorted_indices, axis=-1)
     sorted_probs = jax.nn.softmax(sorted_logits.astype(jnp.float32), axis=-1)
     cumprobs = jnp.cumsum(sorted_probs, axis=-1)
     keep_sorted = cumprobs <= jnp.float32(top_p)

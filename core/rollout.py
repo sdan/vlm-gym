@@ -17,6 +17,15 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+# Apply macOS Metal-friendly env vars before importing jax.
+try:
+    from vlmrl.utils.platform import apply_macos_env, is_macos
+
+    apply_macos_env()
+except Exception:
+    def is_macos() -> bool:  # type: ignore
+        return False
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -216,6 +225,8 @@ def _sample_prompt(
     rng: jax.Array,
     return_logprobs: bool,
     max_sequence_length: Optional[int],
+    decode_impl: str = "scan",
+    decode_unroll: int = 1,
 ) -> SampledAction:
     """Run the unified sampler on a prepared prompt and normalize outputs."""
     inputs = VLMInputs(
@@ -232,6 +243,8 @@ def _sample_prompt(
         rng=rng,
         tokenizer=tokenizer,
         return_logprobs=return_logprobs,
+        decode_impl=decode_impl,
+        decode_unroll=int(max(1, decode_unroll)),
     )
 
     gen_tokens = result.tokens[0]
@@ -314,6 +327,8 @@ def collect_episodes(
     max_pixels: Optional[int] = None,
     max_sequence_length: Optional[int] = None,
     return_logprobs: bool = True,
+    decode_impl: str = "scan",
+    decode_unroll: int = 1,
 ) -> EpisodeBatch:
     """Collect a batch of environment episodes using the unified sampler."""
     states: List[BaseState] = []
@@ -348,6 +363,8 @@ def collect_episodes(
                 rng=key,
                 return_logprobs=return_logprobs,
                 max_sequence_length=max_sequence_length,
+                decode_impl=decode_impl,
+                decode_unroll=decode_unroll,
             )
         )
 
@@ -451,20 +468,60 @@ def _resolve_image_pad_id(tokenizer, model_dir: str) -> int:
 def main() -> None:
     """Simple CLI for sampling environment episodes without PPO."""
     parser = argparse.ArgumentParser(description="Collect RL episodes using the unified sampler.")
+
+    # Platform-aware defaults for macOS local runs
+    mac = is_macos()
+    default_top_k = 256 if mac else None
+    default_max_new_tokens = 32 if mac else 64
+    default_max_pixels = 16_384 if mac else -1
+    default_dtype = "float32" if mac else None
+    default_decode_impl = "step" if mac else "scan"
+    default_max_seq_len = 256 if mac else None
+
     parser.add_argument("--model_dir", required=True, type=str, help="Model directory containing weights, config, and tokenizer.")
     parser.add_argument("--env_name", required=True, type=str, help="Environment identifier (e.g., vision, geospot).")
     parser.add_argument("--episodes", type=int, default=4, help="Total number of episodes to sample.")
     parser.add_argument("--batch_size", type=int, default=1, help="Episodes to sample in parallel.")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.9)
-    parser.add_argument("--top_k", type=int, default=None)
-    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--top_k", type=int, default=default_top_k)
+    parser.add_argument("--max_new_tokens", type=int, default=default_max_new_tokens)
+    parser.add_argument("--max_sequence_length", type=int, default=default_max_seq_len, help="Optional cap on total prompt+generation token length.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min_pixels", type=int, default=-1, help="Override minimum resized pixels (<=0 keeps default).")
-    parser.add_argument("--max_pixels", type=int, default=-1, help="Override maximum resized pixels (<=0 keeps default).")
+    parser.add_argument("--max_pixels", type=int, default=default_max_pixels, help="Override maximum resized pixels (<=0 keeps default).")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=default_dtype,
+        choices=[None, "float32", "bfloat16", "bf16", "fp32"],
+        help="Override model compute dtype (use float32 on Metal for stability)",
+    )
+    parser.add_argument(
+        "--decode_impl",
+        type=str,
+        default=default_decode_impl,
+        choices=["scan", "step"],
+        help="Decode implementation: scan (fast) or step (Metal-safe).",
+    )
+    parser.add_argument(
+        "--decode_unroll",
+        type=int,
+        default=1,
+        help="Unroll factor for scan decode (suggest 4 or 8 on GPU)",
+    )
     args = parser.parse_args()
 
-    model, params = create_model_from_ckpt(args.model_dir)
+    # Prefer the most precise matmul on METAL to reduce numerical drift.
+    try:
+        from jax import config as jax_config
+
+        if jax.devices() and jax.devices()[0].platform.lower() == "metal":
+            jax_config.update("jax_default_matmul_precision", "highest")
+    except Exception:
+        pass
+
+    model, params = create_model_from_ckpt(args.model_dir, dtype=args.dtype)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=False)
     env = create_env(args.env_name, tokenizer)
     image_pad_id = _resolve_image_pad_id(tokenizer, args.model_dir)
@@ -498,8 +555,10 @@ def main() -> None:
             rng=subkey,
             min_pixels=(args.min_pixels if args.min_pixels and args.min_pixels > 0 else None),
             max_pixels=(args.max_pixels if args.max_pixels and args.max_pixels > 0 else None),
-            max_sequence_length=None,
+            max_sequence_length=(args.max_sequence_length if args.max_sequence_length and args.max_sequence_length > 0 else None),
             return_logprobs=False,
+            decode_impl=args.decode_impl,
+            decode_unroll=int(max(1, args.decode_unroll)),
         )
         for episode in batch.episodes:
             rewards.append(float(episode.reward))
