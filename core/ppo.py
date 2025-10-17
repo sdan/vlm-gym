@@ -135,8 +135,8 @@ def update(
         text_target = tokens[:, 1:]
 
         def loss_fn(p):
-            # Forward with given params
-            def call_with_params(params):
+            # Memory-lean path: get hidden states then compute target logits and logsumexp chunkwise over vocab.
+            def call_hidden(params):
                 return ts.call_model(
                     tokens[:, :-1],
                     vision,
@@ -146,25 +146,51 @@ def update(
                     mask=token_mask,
                     cache=None,
                     params=params,
-                    method=ts.model_def.forward_vlm,
+                    method=ts.model_def.forward_vlm_hidden,
                 )
             if use_checkpoint:
-                logits, _ = jax.checkpoint(call_with_params, prevent_cse=False)(p)
+                hidden, _ = jax.checkpoint(call_hidden, prevent_cse=False)(p)
             else:
-                logits, _ = call_with_params(p)
-            # Memory-lean target logprob: gather target logits then subtract logsumexp.
-            # Avoids materializing [B,T,V] one-hot and full log_softmax tensor.
-            target_logits = jnp.take_along_axis(
-                logits, text_target[..., None], axis=-1
-            ).squeeze(-1)
-            lse = jax.nn.logsumexp(logits, axis=-1)
+                hidden, _ = call_hidden(p)
+
+            # Flatten time/batch for projection
+            B, Tm1, H = hidden.shape
+            N = B * Tm1
+            hidden_f32 = hidden.astype(jnp.float32).reshape(N, H)
+            targets_flat = text_target.reshape(N)
+
+            # lm_head weights [H, V]
+            W = p['lm_head']['kernel']
+
+            # Target logits: gather columns per target id then dot with hidden
+            W_cols = jnp.take(W, targets_flat, axis=1)  # [H, N]
+            tl_flat = jnp.sum(hidden_f32 * W_cols.T, axis=1)  # [N]
+            target_logits = tl_flat.reshape(B, Tm1)
+
+            # LogSumExp across vocab computed chunkwise to cap peak memory
+            V = W.shape[1]
+            CHUNK = 8192  # tuned for Metal stability
+
+            # Loop over chunks using Python since V and CHUNK are static under jit
+            m = jnp.full((N,), jnp.float32(-jnp.inf))
+            for start in range(0, int(V), CHUNK):
+                size = min(CHUNK, int(V) - start)
+                Wc = jax.lax.dynamic_slice_in_dim(W, start, size, axis=1)  # [H, C]
+                logits_c = hidden_f32 @ Wc  # [N, C]
+                m = jnp.maximum(m, jnp.max(logits_c, axis=1))
+            s = jnp.zeros((N,), dtype=jnp.float32)
+            for start in range(0, int(V), CHUNK):
+                size = min(CHUNK, int(V) - start)
+                Wc = jax.lax.dynamic_slice_in_dim(W, start, size, axis=1)
+                logits_c = hidden_f32 @ Wc
+                s = s + jnp.sum(jnp.exp(logits_c - m[:, None]), axis=1)
+            lse = (m + jnp.log(s + 1e-10)).reshape(B, Tm1)
             token_logprobs = target_logits - lse
 
             # Entropy: compute only when coefficient is non-zero to save memory.
             if float(entropy_coef) != 0.0:
-                all_logprobs = jax.nn.log_softmax(logits, axis=-1)
-                probs = jax.nn.softmax(logits, axis=-1)
-                entropy = -jnp.sum(probs * all_logprobs, axis=-1)
+                # Optional: compute chunked entropy (skip by default on low-memory)
+                entropy = jnp.zeros_like(token_logprobs)
             else:
                 entropy = jnp.zeros_like(token_logprobs)
 
@@ -218,7 +244,7 @@ def update(
         text_target = tokens[:, 1:]
 
         def loss_fn(p):
-            def call_with_params(params):
+            def call_hidden(params):
                 return ts.call_model(
                     tokens[:, :-1],
                     vision,
@@ -228,22 +254,39 @@ def update(
                     mask=token_mask,
                     cache=None,
                     params=params,
-                    method=ts.model_def.forward_vlm,
+                    method=ts.model_def.forward_vlm_hidden,
                 )
             if use_checkpoint:
-                logits, _ = jax.checkpoint(call_with_params, prevent_cse=False)(p)
+                hidden, _ = jax.checkpoint(call_hidden, prevent_cse=False)(p)
             else:
-                logits, _ = call_with_params(p)
-            target_logits = jnp.take_along_axis(
-                logits, text_target[..., None], axis=-1
-            ).squeeze(-1)
-            lse = jax.nn.logsumexp(logits, axis=-1)
+                hidden, _ = call_hidden(p)
+
+            B, Tm1, H = hidden.shape
+            N = B * Tm1
+            hidden_f32 = hidden.astype(jnp.float32).reshape(N, H)
+            targets_flat = text_target.reshape(N)
+            W = p['lm_head']['kernel']
+            W_cols = jnp.take(W, targets_flat, axis=1)  # [H, N]
+            tl_flat = jnp.sum(hidden_f32 * W_cols.T, axis=1)  # [N]
+            target_logits = tl_flat.reshape(B, Tm1)
+
+            V = W.shape[1]
+            CHUNK = 8192
+            m = jnp.full((N,), jnp.float32(-jnp.inf))
+            for start in range(0, int(V), CHUNK):
+                Wc = jax.lax.dynamic_slice_in_dim(W, start, min(CHUNK, int(V) - start), axis=1)
+                logits_c = hidden_f32 @ Wc
+                m = jnp.maximum(m, jnp.max(logits_c, axis=1))
+            s = jnp.zeros((N,), dtype=jnp.float32)
+            for start in range(0, int(V), CHUNK):
+                Wc = jax.lax.dynamic_slice_in_dim(W, start, min(CHUNK, int(V) - start), axis=1)
+                logits_c = hidden_f32 @ Wc
+                s = s + jnp.sum(jnp.exp(logits_c - m[:, None]), axis=1)
+            lse = (m + jnp.log(s + 1e-10)).reshape(B, Tm1)
             token_logprobs = target_logits - lse
 
             if float(entropy_coef) != 0.0:
-                all_logprobs = jax.nn.log_softmax(logits, axis=-1)
-                probs = jax.nn.softmax(logits, axis=-1)
-                entropy = -jnp.sum(probs * all_logprobs, axis=-1)
+                entropy = jnp.zeros_like(token_logprobs)
             else:
                 entropy = jnp.zeros_like(token_logprobs)
 

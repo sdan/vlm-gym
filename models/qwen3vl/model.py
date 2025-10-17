@@ -869,6 +869,74 @@ class Qwen3VLModel(nn.Module):
             deepstack=vision_pack.deepstack,
         )
 
+    def forward_vlm_hidden(
+        self,
+        tokens: jax.Array,
+        vision_embeds: Union[jax.Array, VisionEmbeddings],
+        image_pad_id: int,
+        cos: jax.Array,
+        sin: jax.Array,
+        mask: Optional[jax.Array] = None,
+        cache: Optional[KVCache] = None,
+    ) -> tuple[jax.Array, Optional[KVCache]]:
+        """Same as forward_vlm but returns the final normalized hidden states.
+
+        This is useful for memory-lean losses that avoid materializing the
+        full [B, T, V] logits tensor. The returned hidden is the output of
+        the final RMSNorm and matches the input expected by `lm_head` when
+        cast to fp32.
+        """
+        hidden = self.embed(tokens)
+        batch = hidden.shape[0]
+
+        if isinstance(vision_embeds, VisionEmbeddings):
+            vision_pack = vision_embeds.cast(self.dtype).with_batch_dim(batch)
+        else:
+            vision_arr = jnp.asarray(vision_embeds, dtype=self.dtype)
+            if vision_arr.ndim == 2:
+                vision_arr = vision_arr[None, ...]
+            if vision_arr.shape[0] not in (1, batch):
+                raise ValueError(
+                    "vision_embeds batch dimension must be 1 or match tokens batch"
+                )
+            if vision_arr.shape[0] == 1 and batch > 1:
+                vision_arr = jnp.tile(vision_arr, (batch, 1, 1))
+            vision_pack = VisionEmbeddings(tokens=vision_arr, deepstack=())
+
+        visual_mask = (tokens == jnp.int32(image_pad_id))
+
+        def _inject(batch_hidden, batch_tokens, batch_vis):
+            num_vision = batch_vis.shape[0]
+            pad_positions = jnp.where(
+                batch_tokens == jnp.int32(image_pad_id), size=num_vision, fill_value=-1
+            )[0]
+            valid = pad_positions >= 0
+            pad_positions = jnp.where(valid, pad_positions, 0)
+            updates = jnp.where(valid[:, None], batch_vis.astype(batch_hidden.dtype), batch_hidden[pad_positions])
+            batch_hidden = batch_hidden.at[pad_positions].set(updates)
+            return batch_hidden
+
+        hidden = jax.vmap(_inject)(hidden, tokens, vision_pack.tokens)
+
+        new_cache = cache
+        last_layer_idx = len(self.layers) - 1
+        deepstack = vision_pack.deepstack or ()
+        for layer_id, layer in enumerate(self.layers):
+            hidden, new_cache = layer(
+                hidden,
+                cos,
+                sin,
+                mask,
+                new_cache,
+                layer_id,
+                update_lengths=bool(cache is not None and layer_id == last_layer_idx),
+            )
+            if deepstack and layer_id < len(deepstack) and visual_mask is not None:
+                hidden = self._apply_deepstack_features(hidden, visual_mask, deepstack[layer_id])
+
+        hidden = self.final_norm(hidden)
+        return hidden, new_cache
+
     def encode_vision(self, pixel_values: jax.Array, grid_thw: jax.Array) -> VisionEmbeddings:
         if self.visual is None:
             raise ValueError("Vision backbone not configured for this model")

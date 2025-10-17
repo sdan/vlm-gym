@@ -22,6 +22,16 @@ from typing import Any, Dict, Optional
 # This was annoying and should probably not be off by default
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
+# Ensure macOS Metal-friendly env vars are set before importing jax.
+try:
+    from vlmrl.utils.platform import apply_macos_env, apply_macos_train_overrides, is_macos
+
+    apply_macos_env()
+except Exception:
+    # If platform helper fails for any reason, continue with defaults.
+    def is_macos() -> bool:  # type: ignore
+        return False
+
 import jax
 import jax.numpy as jnp
 import ml_collections
@@ -104,6 +114,13 @@ config = ml_collections.ConfigDict({
     # stricter vision pixel cap, skip DeepStack staging.
     "low_memory": 0,
 })
+
+# Apply macOS-specific default overrides (CLI flags still win).
+try:
+    apply_macos_train_overrides(config)
+except Exception:
+    pass
+
 define_flag_dict(config)
 FLAGS = flags.FLAGS
 
@@ -353,6 +370,15 @@ def _maybe_save(train_state: TrainState, save_dir: str, step: int) -> None:
 
 def main(_):
     FLAGS(sys.argv)
+
+    # Prefer the most precise matmul on METAL to reduce numerical drift.
+    try:
+        from jax import config as jax_config
+
+        if jax.devices() and jax.devices()[0].platform.lower() == "metal":
+            jax_config.update("jax_default_matmul_precision", "highest")
+    except Exception:
+        pass
 
     # Apply low-memory overrides early so downstream config picks them up.
     low_mem = bool(int(getattr(FLAGS, "low_memory", 0) or 0) == 1)
