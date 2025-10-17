@@ -107,6 +107,7 @@ def update(
     minibatch_size: int = 64,
     num_epochs: int = 1,
     kl_ctrl: Optional[AdaptiveKL] = None,
+    use_checkpoint: bool = False,
 ) -> Tuple[TrainState, dict]:
     """Apply PPO-style updates over minibatches and return new TrainState + metrics."""
     tokens_all = batch.tokens
@@ -147,7 +148,10 @@ def update(
                     params=params,
                     method=ts.model_def.forward_vlm,
                 )
-            logits, _ = call_with_params(p)
+            if use_checkpoint:
+                logits, _ = jax.checkpoint(call_with_params, prevent_cse=False)(p)
+            else:
+                logits, _ = call_with_params(p)
             # Memory-lean target logprob: gather target logits then subtract logsumexp.
             # Avoids materializing [B,T,V] one-hot and full log_softmax tensor.
             target_logits = jnp.take_along_axis(
@@ -226,7 +230,10 @@ def update(
                     params=params,
                     method=ts.model_def.forward_vlm,
                 )
-            logits, _ = call_with_params(p)
+            if use_checkpoint:
+                logits, _ = jax.checkpoint(call_with_params, prevent_cse=False)(p)
+            else:
+                logits, _ = call_with_params(p)
             target_logits = jnp.take_along_axis(
                 logits, text_target[..., None], axis=-1
             ).squeeze(-1)

@@ -50,22 +50,32 @@ def install_dependencies():
     run("uv venv .venv --python 3.10")
     run("uv pip install -e .")
 
-    # Install JAX TPU version
+    # Install JAX TPU version (use pip for better TPU compatibility)
     print("Installing JAX TPU version...")
-    run("uv pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html")
+    run("pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html")
 
 
 def configure_tpu():
     """Configure JAX for TPU runtime."""
+    # Clear any TPU locks
+    run("sudo pkill -9 python3 || true", check=False)
+    run("sudo rm -rf /tmp/libtpu_lockfile /tmp/tpu_logs || true", check=False)
+
+    # Force TPU platform
+    os.environ['JAX_PLATFORMS'] = 'tpu'
+
     try:
         import jax
+        print(f"JAX version: {jax.__version__}")
         print(f"JAX devices: {jax.devices()}")
         print(f"Device count: {jax.device_count()}")
-        print(f"Local device count: {jax.local_device_count()}")
+        print(f"Platform: {jax.devices()[0].platform}")
 
         # Verify TPU
         if jax.devices()[0].platform != "tpu":
-            print("WARNING: No TPU detected. Running on CPU/GPU.")
+            print("⚠ WARNING: No TPU detected. Running on CPU/GPU.")
+            print("Please select: Runtime > Change runtime type > TPU")
+            raise RuntimeError("TPU runtime required")
         else:
             print(f"✓ TPU runtime ready: {jax.local_device_count()} cores")
     except ImportError:
@@ -87,7 +97,9 @@ def download_checkpoint():
 
 def run_training():
     """Execute single rollout + 100-step training on TPU."""
-    # Training flags optimized for TPU low-memory mode
+    # Training flags optimized for TPU v3-8 low-memory mode
+    # - bf16 params + Adafactor + gradient checkpointing
+    # - ppo_minibatch=8 enables pmap across 8 TPU cores (1 sample/core)
     flags = {
         "low_memory": 1,
         "model_dir": "checkpoints/qwen3vl_4b",
@@ -101,23 +113,27 @@ def run_training():
 
         # Training duration
         "total_steps": 100,
-        "batch_size": 4,  # Small for quick test
+        "batch_size": 2,  # Reduced for TPU memory
         "log_interval": 10,
 
         # Sampling
         "temperature": 0.7,
-        "max_new_tokens": 32,  # Shorter for speed
-        "vlm_max_pixels": 120_000,  # Low-mem cap
+        "max_new_tokens": 24,  # Reduced for memory
+        "vlm_max_pixels": 65_000,  # Reduced for memory
 
         # PPO tuned for TPU
-        "ppo_minibatch": 8,  # Divisible by typical TPU core counts (8)
+        "ppo_minibatch": 8,  # Enables pmap on v3-8 (8 cores)
         "ppo_epochs": 1,
-        "clip_epsilon": 0.2,
 
         # Optimizer
         "optimizer": "adafactor",
         "learning_rate": 1e-6,
         "max_grad_norm": 1.0,
+
+        # Memory optimizations
+        "grad_checkpoint": 1,
+        "entropy_coef": 0.0,
+        "use_ema": 0,
     }
 
     flag_str = " ".join(f"--{k}={v}" for k, v in flags.items())

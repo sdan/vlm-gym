@@ -90,6 +90,8 @@ config = ml_collections.ConfigDict({
     "kl_coef_max": 0.5,
     "ppo_minibatch": 64,
     "ppo_epochs": 1,
+    # Memory helpers
+    "grad_checkpoint": 0,
 
     # Optimizer
     "optimizer": "adamw",
@@ -368,10 +370,18 @@ def main(_):
                 FLAGS.vlm_max_pixels = 120_000
         except Exception:
             pass
-        # Keep PPO microbatch small to trim logits memory.
+        # Keep PPO microbatch small but ensure it uses all local devices for pmap.
         try:
-            if int(getattr(FLAGS, "ppo_minibatch", 64) or 64) > 4:
-                FLAGS.ppo_minibatch = 2
+            ndev = max(1, int(jax.local_device_count()))
+            current_mb = int(getattr(FLAGS, "ppo_minibatch", 64) or 64)
+            # Do not downscale if user set a larger value; only bump up to at least ndev.
+            if current_mb < ndev:
+                FLAGS.ppo_minibatch = ndev
+        except Exception:
+            pass
+        # Enable gradient checkpointing to reduce activation memory during backward.
+        try:
+            FLAGS.grad_checkpoint = 1
         except Exception:
             pass
         # Collection batch can also be trimmed on small-memory devices.
@@ -480,6 +490,7 @@ def main(_):
             minibatch_size=trainer_cfg.ppo_minibatch,
             num_epochs=trainer_cfg.num_epochs,
             kl_ctrl=kl_ctrl,
+            use_checkpoint=bool(int(getattr(FLAGS, "grad_checkpoint", 0) or 0) == 1),
         )
 
         returns = np.asarray(jax.device_get(rollout.returns))

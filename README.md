@@ -6,7 +6,10 @@ Status: Alpha - PPO support only, expect GRPO support and more documentation. In
 
 A simple reinforcement learning gym for vision-language models, written in JAX. Drop in any environment, any model, and train with PPO.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/sdan/vlm-gym/blob/low-mem-gpu/colab_setup.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](uv run python -m vlmrl.core.train --model_dir checkpoints/qwen3vl_4b --env_name geospot
+  --total_steps=1 --batch_size=16 --ppo_minibatch=16 --ppo_epochs=1 --max_sequence_length=1536
+  --vlm_max_pixels=262144
+  )
 
 **Core components:**
 - `envs/` — Pluggable vision environments (GeoGauessr, NLVR2, captioning)
