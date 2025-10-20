@@ -1,16 +1,6 @@
-Status: Experimental, tested on Qwen3-VL-4B-Instruct and Qwen2.5-VL-7B as the default models
+#### Status: Experimental, tested on Qwen3-VL-4B-Instruct and Qwen2.5-VL-7B. Currently inference runs at 1.5 tok/sec and training requires at least 1 A100 80GB. Some stability improvements are necessary to reduce memory and increase throughput, WIP.
+
 <img width="325" height="240" alt="vlmgym" src="https://github.com/user-attachments/assets/87d7d141-4464-4687-91c0-3a6da82b2749" />
-
-------------
-
-Inference:
-
-https://github.com/user-attachments/assets/ac28b556-049e-413c-bcf1-e6944eb80af0
-
-Training:
-<img width="1321" height="394" alt="Screenshot 2025-10-18 at 5 47 31 PM" src="https://github.com/user-attachments/assets/8014903a-d6cc-495b-a8df-a228921fe2e9" />
-
-------------
 
 # vlm-gym
 
@@ -38,6 +28,8 @@ uv run python -m core.rollout
   --model_dir checkpoints/qwen3vl_4b \
   --env_name geospot
 ```
+https://github.com/user-attachments/assets/ac28b556-049e-413c-bcf1-e6944eb80af0
+
 
 ## Train a VLM to play GeoGuessr
 
@@ -58,6 +50,8 @@ uv run python core/train.py \
   --lr 5e-7 \
   --total_steps 10000
 ```
+<img width="1321" height="394" alt="Screenshot 2025-10-18 at 5 47 31 PM" src="https://github.com/user-attachments/assets/8014903a-d6cc-495b-a8df-a228921fe2e9" />
+
 ---
 
 **Sample**
