@@ -1,6 +1,16 @@
-Status: Alpha - PPO support only, expect GRPO support and more documentation. Inference runs smoothly, however training runs currently memoryconstrained to low batch sizes with >80gb of VRAM GPUs. Qwen3-VL-4B-Instruct as the default model.
-
+Status: Experimental, tested on Qwen3-VL-4B-Instruct and Qwen2.5-VL-7B as the default models
 <img width="325" height="240" alt="vlmgym" src="https://github.com/user-attachments/assets/87d7d141-4464-4687-91c0-3a6da82b2749" />
+
+------------
+
+Inference:
+
+https://github.com/user-attachments/assets/ac28b556-049e-413c-bcf1-e6944eb80af0
+
+Training:
+<img width="1321" height="394" alt="Screenshot 2025-10-18 at 5 47 31 PM" src="https://github.com/user-attachments/assets/8014903a-d6cc-495b-a8df-a228921fe2e9" />
+
+------------
 
 # vlm-gym
 
