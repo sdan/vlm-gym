@@ -472,7 +472,8 @@ class MultiHeadAttention(nn.Module):
         cache: Optional["KVCache"] = None,
         layer_id: Optional[int] = None,
         update_lengths: bool = False,
-    ) -> tuple[jax.Array, Optional["KVCache"]]:
+        return_head_max: bool = False,
+    ) -> tuple[jax.Array, Optional["KVCache"], Optional[jax.Array]]:
         q = nn.Dense(
             self.num_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="q_proj"
         )(x)
@@ -571,6 +572,10 @@ class MultiHeadAttention(nn.Module):
             causal = jnp.tril(jnp.ones((q_len, k_len), dtype=jnp.float32))  # causal triangle
             attn_scores = attn_scores + (1.0 - causal)[None, None, :, :] * -1e9
         attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+        head_max: Optional[jax.Array] = None
+        if return_head_max:
+            # Per-head max attention on the last query position
+            head_max = jnp.max(attn_weights[:, :, -1, :], axis=-1)  # [B, H]
         
         # Apply attention weights with grouped-query pattern if needed
         if self.num_heads != self.num_kv_heads:
@@ -611,7 +616,7 @@ class MultiHeadAttention(nn.Module):
         out = nn.Dense(self.hidden_size, use_bias=False, dtype=self.dtype, name="o_proj")(
             attn_output
         )
-        return out, cache
+        return out, cache, head_max
 
 
 class DecoderBlock(nn.Module):
@@ -651,8 +656,9 @@ class DecoderBlock(nn.Module):
         cache: Optional["KVCache"],
         layer_id: int,
         update_lengths: bool = False,
-    ) -> tuple[jax.Array, Optional["KVCache"]]:
-        attn_out, cache = self.attn(
+        collect_attn: bool = False,
+    ) -> tuple[jax.Array, Optional["KVCache"], Optional[jax.Array]]:
+        attn_out, cache, head_max = self.attn(
             self.input_norm(hidden_states),
             cos,
             sin,
@@ -660,10 +666,11 @@ class DecoderBlock(nn.Module):
             cache,
             layer_id,
             update_lengths=update_lengths,
+            return_head_max=collect_attn,
         )
         hidden_states = hidden_states + attn_out  # res
         hidden_states = hidden_states + self.mlp(self.post_norm(hidden_states))  # res
-        return hidden_states, cache
+        return hidden_states, cache, head_max
 
 
 class KVCache(flax.struct.PyTreeNode):
@@ -785,12 +792,15 @@ class Qwen3VLModel(nn.Module):
         cache: Optional[KVCache] = None,
         visual_mask: Optional[jax.Array] = None,
         deepstack: Optional[tuple[jax.Array, ...]] = None,
-    ) -> tuple[jax.Array, Optional[KVCache]]:
+        *,
+        collect_attn: bool = False,
+    ) -> tuple[jax.Array, Optional[KVCache], Optional[jax.Array]]:
         new_cache = cache
         last_layer_idx = len(self.layers) - 1
         deepstack = deepstack or ()
+        attn_rows: list[jax.Array] = []
         for layer_id, layer in enumerate(self.layers):
-            hidden, new_cache = layer(
+            hidden, new_cache, head_max = layer(
                 hidden,
                 cos,
                 sin,
@@ -798,12 +808,20 @@ class Qwen3VLModel(nn.Module):
                 new_cache,
                 layer_id,
                 update_lengths=bool(cache is not None and layer_id == last_layer_idx),  # bump cache len at last layer
+                collect_attn=collect_attn,
             )
+            if collect_attn and head_max is not None:
+                attn_rows.append(head_max)  # [B, H]
             if deepstack and layer_id < len(deepstack) and visual_mask is not None:
                 hidden = self._apply_deepstack_features(hidden, visual_mask, deepstack[layer_id])
         hidden = self.final_norm(hidden)
         logits = self.lm_head(hidden.astype(jnp.float32))  # keep logits in fp32
-        return logits, new_cache
+        attn_summary: Optional[jax.Array] = None
+        if collect_attn and attn_rows:
+            # Stack per-layer rows -> [L, B, H], take last 6 layers -> [N<=6, B, H]
+            rows = jnp.stack(attn_rows, axis=0)
+            attn_summary = rows[-6:, ...]
+        return logits, new_cache, attn_summary
 
     def forward_text(
         self,
@@ -812,9 +830,18 @@ class Qwen3VLModel(nn.Module):
         sin: jax.Array,
         mask: Optional[jax.Array] = None,
         cache: Optional[KVCache] = None,
-    ) -> tuple[jax.Array, Optional[KVCache]]:
+        *,
+        collect_attn: bool = False,
+    ) -> tuple[jax.Array, Optional[KVCache], Optional[jax.Array]]:
         hidden = self.embed(tokens)
-        return self._decode_from_hidden(hidden, cos, sin, mask, cache)
+        return self._decode_from_hidden(
+            hidden,
+            cos,
+            sin,
+            mask,
+            cache,
+            collect_attn=collect_attn,
+        )
 
     def forward_vlm(
         self,
@@ -825,7 +852,9 @@ class Qwen3VLModel(nn.Module):
         sin: jax.Array,
         mask: Optional[jax.Array] = None,
         cache: Optional[KVCache] = None,
-    ) -> tuple[jax.Array, Optional[KVCache]]:
+        *,
+        collect_attn: bool = False,
+    ) -> tuple[jax.Array, Optional[KVCache], Optional[jax.Array]]:
         hidden = self.embed(tokens)
         batch = hidden.shape[0]
 
@@ -867,6 +896,7 @@ class Qwen3VLModel(nn.Module):
             cache,
             visual_mask=visual_mask,
             deepstack=vision_pack.deepstack,
+            collect_attn=collect_attn,
         )
 
     def forward_vlm_hidden(
@@ -922,7 +952,7 @@ class Qwen3VLModel(nn.Module):
         last_layer_idx = len(self.layers) - 1
         deepstack = vision_pack.deepstack or ()
         for layer_id, layer in enumerate(self.layers):
-            hidden, new_cache = layer(
+            hidden, new_cache, _ = layer(
                 hidden,
                 cos,
                 sin,
@@ -949,7 +979,9 @@ class Qwen3VLModel(nn.Module):
         cache: KVCache,
         rope_deltas: Optional[jax.Array],
         mask: Optional[jax.Array] = None,
-    ) -> tuple[jax.Array, KVCache]:
+        *,
+        collect_attn: bool = False,
+    ) -> tuple[jax.Array, KVCache, jax.Array]:
         if token.ndim != 1:
             raise ValueError("token must have shape (batch,)")
         positions = cache.lengths[:, None]  # next token positions
@@ -974,8 +1006,20 @@ class Qwen3VLModel(nn.Module):
         step_tokens = token[:, None]
         if mask is None:
             mask = jnp.ones((step_tokens.shape[0], 1), dtype=jnp.int32)
-        logits, new_cache = self.forward_text(step_tokens, cos, sin, mask=mask, cache=cache)
-        return logits[:, -1, :], new_cache
+        logits, new_cache, attn_summary = self.forward_text(
+            step_tokens,
+            cos,
+            sin,
+            mask=mask,
+            cache=cache,
+            collect_attn=collect_attn,
+        )
+        # Normalize attn_summary to [N, H] (batch squeezed) with stable shape when disabled
+        if attn_summary is None:
+            attn_out = jnp.zeros((6, int(self.spec.text.num_attention_heads)), dtype=jnp.float32)
+        else:
+            attn_out = attn_summary[:, 0, :].astype(jnp.float32)
+        return logits[:, -1, :], new_cache, attn_out
 
     def __call__(
         self,
@@ -985,7 +1029,8 @@ class Qwen3VLModel(nn.Module):
         mask: Optional[jax.Array] = None,
         cache: Optional[KVCache] = None,
     ) -> tuple[jax.Array, Optional[KVCache]]:
-        return self.forward_text(tokens, cos, sin, mask=mask, cache=cache)
+        logits, cache = self.forward_text(tokens, cos, sin, mask=mask, cache=cache)[:2]
+        return logits, cache
 
 
 def _load_hf_config(hf_dir: str) -> dict[str, Any]:

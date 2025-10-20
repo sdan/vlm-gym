@@ -49,6 +49,7 @@ from vlmrl.utils.checkpoint import Checkpoint
 from vlmrl.utils.configs import define_flag_dict
 from vlmrl.utils.train_state import TrainState
 from vlmrl.utils.wandb import setup_wandb, define_env_metrics, summarize_env_metrics
+from vlmrl.core.trace import compute_update_heat
 
 
 config = ml_collections.ConfigDict({

@@ -76,8 +76,9 @@ def _prefill_text(model, params, tokens: jnp.ndarray, pad_id: int, spec: _RopeSp
 
     @jax.jit
     def _prefill(params, tokens, cos, sin, mask, cache):
-        _, cache_out = model.apply({"params": params}, tokens, cos, sin, mask=mask, cache=cache, method=model.forward_text)
-        return cache_out
+        out = model.apply({"params": params}, tokens, cos, sin, mask=mask, cache=cache, method=model.forward_text)
+        # out: (logits, cache, attn?)
+        return out[1]
 
     cache_out = _prefill(params, tokens, cos, sin, mask, cache)
     rope_deltas = jnp.zeros((tokens.shape[0], 1), dtype=jnp.int32)
@@ -137,7 +138,7 @@ def _prefill_vlm(
 
     @jax.jit
     def _prefill(params, tokens, vision_pack, image_pad_id, cos, sin, mask, cache):
-        logits, cache_out = model.apply(
+        out = model.apply(
             {"params": params},
             tokens,
             vision_pack,
@@ -148,7 +149,7 @@ def _prefill_vlm(
             cache=cache,
             method=model.forward_vlm,
         )
-        return logits, cache_out
+        return out[0], out[1]
 
     logits, cache = _prefill(params, tokens, vision_pack, image_pad_id, cos, sin, mask, cache)
     rope_deltas = deltas.astype(jnp.int32)
@@ -193,7 +194,7 @@ def _decode_loop(
             cache_state, current_tok, rng_state, stopped = carry
             rng_state, step_key = jax.random.split(rng_state)
             step_mask = (jnp.logical_not(stopped)).astype(jnp.int32)[:, None]
-            logits, cache_state = model.apply(
+            logits, cache_state, _ = model.apply(
                 {"params": params},
                 current_tok,
                 cache_state,
@@ -266,6 +267,7 @@ def _decode_loop_stepwise(
     rope_deltas: Optional[jnp.ndarray],
     rng: jax.Array,
     return_logprobs: bool,
+    step_callback: Optional[object] = None,
 ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
     """Step-by-step decode where each step is a small jitted call.
 
@@ -289,16 +291,19 @@ def _decode_loop_stepwise(
     _is_metal = (jax.devices()[0].platform.lower() == "metal")
     _donate = () if _is_metal else (2,)
 
-    @partial(jax.jit, donate_argnums=_donate)
-    def _one_step(params, offsets, cache_state, current_tok, rng_state, stopped):
+    # Mark `enable_attn` as static so Python control flow depending on it
+    # (e.g., inside model.apply -> attention) is resolved at trace time.
+    @partial(jax.jit, donate_argnums=_donate, static_argnums=(6,))
+    def _one_step(params, offsets, cache_state, current_tok, rng_state, stopped, enable_attn: bool):
         rng_state, step_key = jax.random.split(rng_state)
         step_mask = (jnp.logical_not(stopped)).astype(jnp.int32)[:, None]
-        logits, cache_state = model.apply(
+        logits, cache_state, attn_row = model.apply(
             {"params": params},
             current_tok,
             cache_state,
             offsets,
             step_mask,
+            collect_attn=enable_attn,
             method=model.decode_step,
         )
         logits = logits.astype(jnp.float32) / temp
@@ -324,7 +329,7 @@ def _decode_loop_stepwise(
         hit_eos = jnp.logical_and(has_eos, next_token == eos_scalar)
         stopped_new = jnp.logical_or(stopped, hit_eos)
         effective_next = jnp.where(jnp.logical_and(stopped, has_eos), jnp.broadcast_to(eos_scalar, next_token.shape), next_token)
-        return cache_state, effective_next.astype(jnp.int32), rng_state, stopped_new, gathered.astype(jnp.float32)
+        return cache_state, effective_next.astype(jnp.int32), rng_state, stopped_new, gathered.astype(jnp.float32), attn_row
 
     tokens_acc: List[jnp.ndarray] = []
     logprobs_acc: List[jnp.ndarray] = []
@@ -332,13 +337,44 @@ def _decode_loop_stepwise(
     rng_state = rng
     stopped = jnp.zeros_like(tok, dtype=jnp.bool_)
     cache_state = cache
-    for _ in range(int(steps)):
-        cache_state, tok, rng_state, stopped, logp = _one_step(
-            params, offsets, cache_state, tok, rng_state, stopped
+    # Attention summary config
+    enable_attn = bool(step_callback is not None)
+    for i in range(int(steps)):
+        cache_state, tok, rng_state, stopped, logp, attn_row = _one_step(
+            params, offsets, cache_state, tok, rng_state, stopped, enable_attn
         )
         tokens_acc.append(tok)
         if return_logprobs:
             logprobs_acc.append(logp)
+
+        # Optional per-step callback (Python side) for live UIs
+        if step_callback is not None:
+            try:
+                # Convert small scalars to Python types
+                token_id = int(np.asarray(tok[0]).item())
+                cache_len = int(np.asarray(cache_state.lengths[0]).item())
+                cache_max = int(np.asarray(cache_state.keys.shape[3]).item())
+                token_lp = float(np.asarray(logp[0]).item())
+                rope_delta = int(np.asarray(offsets[0, 0]).item()) if offsets.ndim == 2 else int(np.asarray(offsets[0]).item())
+                info = {
+                    "step": int(i + 1),
+                    "token_id": token_id,
+                    "logprob": token_lp,
+                    "cache_len": cache_len,
+                    "cache_max": cache_max,
+                    "rope_delta": rope_delta,
+                }
+                if enable_attn:
+                    # attn_row: [N, H]
+                    at = np.asarray(attn_row)
+                    if at.size > 0:
+                        info["attn_heads"] = at  # numpy array ok; callback converts/uses
+                try:
+                    step_callback(info)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     new_tokens = jnp.stack(tokens_acc, axis=1)
     if return_logprobs:
@@ -359,6 +395,7 @@ def sample(
     return_logprobs: bool = False,
     decode_impl: str = "scan",
     decode_unroll: int = 1,
+    step_callback: Optional[object] = None,
 ) -> SampleResult:
     """Unified sampler entry point.
 
@@ -412,6 +449,7 @@ def sample(
             rope_deltas=rope_deltas,
             rng=rng,
             return_logprobs=return_logprobs,
+            step_callback=step_callback,
         )
     else:
         new_tokens, new_logprobs = _decode_loop(
