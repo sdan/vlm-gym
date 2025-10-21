@@ -1,4 +1,4 @@
-#### Status: Experimental, tested on Qwen3-VL-4B-Instruct and Qwen2.5-VL-7B. Currently inference runs at 1.5 tok/sec and training requires at least 1 A100 80GB. Some stability improvements are necessary to reduce memory and increase throughput, WIP.
+#### Status: Experimental
 
 <img width="325" height="240" alt="vlmgym" src="https://github.com/user-attachments/assets/87d7d141-4464-4687-91c0-3a6da82b2749" />
 
