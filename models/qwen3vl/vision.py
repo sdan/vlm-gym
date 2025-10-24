@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 
 from .model import rotate_half
+from vlmrl.models.lora import LoRAConfig, LoRADense
 
 
 from .model import VisionBackboneSpec
@@ -34,11 +35,14 @@ class VisionPatchEmbed(nn.Module):
     embed_dim: int
     patch_volume: int
     dtype: DType = jnp.bfloat16
+    lora: Optional[LoRAConfig] = None
 
     @nn.compact
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         # linear patch projection
-        proj = nn.Dense(self.embed_dim, use_bias=False, dtype=self.dtype, name="proj")
+        lora_rank = int(self.lora.rank) if (self.lora and self.lora.enabled and self.lora.apply_vision) else 0
+        proj = LoRADense(self.embed_dim, use_bias=False, dtype=self.dtype, name="proj",
+                         lora_rank=lora_rank, lora_alpha=int(self.lora.alpha) if self.lora else 32)
         return proj(hidden_states.astype(self.dtype))
 
 
@@ -46,6 +50,7 @@ class VisionAttention(nn.Module):
     hidden_size: int
     num_heads: int
     dtype: DType = jnp.bfloat16
+    lora: Optional[LoRAConfig] = None
 
     def setup(self) -> None:
         self.head_dim = self.hidden_size // self.num_heads  # per-head width
@@ -59,7 +64,9 @@ class VisionAttention(nn.Module):
         sin: jax.Array,
         cu_seqlens: jax.Array,
     ) -> jax.Array:
-        qkv = nn.Dense(3 * self.hidden_size, use_bias=True, dtype=self.dtype, name="qkv")(hidden_states)  # fused
+        lora_rank = int(self.lora.rank) if (self.lora and self.lora.enabled and self.lora.apply_vision) else 0
+        qkv = LoRADense(3 * self.hidden_size, use_bias=True, dtype=self.dtype, name="qkv",
+                        lora_rank=lora_rank, lora_alpha=int(self.lora.alpha) if self.lora else 32)(hidden_states)  # fused
         q, k, v = jnp.split(qkv, 3, axis=-1)
 
         seq_len = hidden_states.shape[0]
@@ -110,12 +117,14 @@ class VisionAttention(nn.Module):
             attn_chunks.append(attn_out)
 
         attn_output = jnp.concatenate(attn_chunks, axis=0).reshape(seq_len, self.hidden_size)  # stitch
-        return nn.Dense(self.hidden_size, use_bias=True, dtype=self.dtype, name="proj")(attn_output)
+        return LoRADense(self.hidden_size, use_bias=True, dtype=self.dtype, name="proj",
+                         lora_rank=lora_rank, lora_alpha=int(self.lora.alpha) if self.lora else 32)(attn_output)
 
 
 class VisionBlock(nn.Module):
     spec: "VisionBackboneSpec"
     dtype: DType = jnp.bfloat16
+    lora: Optional[LoRAConfig] = None
 
     def setup(self) -> None:
         # Import lazily to avoid circular dependency at module import time.
@@ -123,12 +132,13 @@ class VisionBlock(nn.Module):
 
         self.norm1 = RMSNorm(self.spec.hidden_size, 1e-6, self.dtype)
         self.norm2 = RMSNorm(self.spec.hidden_size, 1e-6, self.dtype)
-        self.attn = VisionAttention(self.spec.hidden_size, self.spec.num_heads, self.dtype)
+        self.attn = VisionAttention(self.spec.hidden_size, self.spec.num_heads, self.dtype, lora=self.lora)
         self.mlp = FeedForward(
             hidden_size=self.spec.hidden_size,
             intermediate_size=self.spec.intermediate_size,
             dtype=self.dtype,
             use_bias=True,
+            lora=self.lora,
         )
 
     def __call__(
@@ -150,6 +160,7 @@ class VisionPatchMerger(nn.Module):
     spatial_merge_size: int
     use_postshuffle_norm: bool = False
     dtype: DType = jnp.bfloat16
+    lora: Optional[LoRAConfig] = None
 
     def setup(self) -> None:
         from .model import RMSNorm
@@ -158,8 +169,12 @@ class VisionPatchMerger(nn.Module):
         self.hidden_size = self.context_dim * self.unit
         norm_dim = self.hidden_size if self.use_postshuffle_norm else self.context_dim
         self.norm = RMSNorm(norm_dim, 1e-6, self.dtype)
-        self.linear1 = nn.Dense(self.hidden_size, use_bias=True, dtype=self.dtype, name="linear1")
-        self.linear2 = nn.Dense(self.out_dim, use_bias=True, dtype=self.dtype, name="linear2")
+        lora_rank = int(self.lora.rank) if (self.lora and self.lora.enabled and self.lora.apply_vision) else 0
+        lora_alpha = int(self.lora.alpha) if self.lora else 32
+        self.linear1 = LoRADense(self.hidden_size, use_bias=True, dtype=self.dtype, name="linear1",
+                                  lora_rank=lora_rank, lora_alpha=lora_alpha)
+        self.linear2 = LoRADense(self.out_dim, use_bias=True, dtype=self.dtype, name="linear2",
+                                  lora_rank=lora_rank, lora_alpha=lora_alpha)
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         if hidden_states.shape[0] % self.unit != 0:
@@ -178,6 +193,7 @@ class VisionPatchMerger(nn.Module):
 class Qwen3VisionTransformer(nn.Module):
     spec: "VisionBackboneSpec"
     dtype: DType = jnp.float32
+    lora: Optional[LoRAConfig] = None
 
     def setup(self) -> None:
         patch_volume = (
@@ -186,15 +202,16 @@ class Qwen3VisionTransformer(nn.Module):
             * self.spec.patch_size
             * self.spec.patch_size
         )
-        self.patch_embed = VisionPatchEmbed(self.spec.hidden_size, patch_volume, self.dtype)
+        self.patch_embed = VisionPatchEmbed(self.spec.hidden_size, patch_volume, self.dtype, lora=self.lora)
         rotary_dim = (self.spec.hidden_size // self.spec.num_heads) // 2
         self.rotary = VisionRotaryEmbedding(rotary_dim)
-        self.blocks = [VisionBlock(self.spec, dtype=self.dtype) for _ in range(self.spec.depth)]
+        self.blocks = [VisionBlock(self.spec, dtype=self.dtype, lora=self.lora) for _ in range(self.spec.depth)]
         self.merger = VisionPatchMerger(
             context_dim=self.spec.hidden_size,
             out_dim=self.spec.out_hidden_size,
             spatial_merge_size=self.spec.spatial_merge_size,
             dtype=self.dtype,
+            lora=self.lora,
         )
         self.deepstack_visual_indexes = tuple(self.spec.deepstack_visual_indexes)
         self.deepstack_mergers = [
@@ -204,6 +221,7 @@ class Qwen3VisionTransformer(nn.Module):
                 spatial_merge_size=self.spec.spatial_merge_size,
                 use_postshuffle_norm=True,
                 dtype=self.dtype,
+                lora=self.lora,
             )
             for _ in self.deepstack_visual_indexes
         ]
