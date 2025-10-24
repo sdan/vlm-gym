@@ -372,8 +372,6 @@ def _maybe_save(train_state: TrainState, save_dir: str, step: int) -> None:
 
 
 def main(_):
-    FLAGS(sys.argv)
-
     if jax.process_index() == 0:
         print(f"[train] Loading model from {FLAGS.model_dir}")
 
