@@ -9,6 +9,7 @@ sampling via the VLMInputs type.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Union, Tuple, List
 
 import jax
@@ -75,8 +76,9 @@ def _prefill_text(model, params, tokens: jnp.ndarray, pad_id: int, spec: _RopeSp
 
     @jax.jit
     def _prefill(params, tokens, cos, sin, mask, cache):
-        _, cache_out = model.apply({"params": params}, tokens, cos, sin, mask=mask, cache=cache, method=model.forward_text)
-        return cache_out
+        out = model.apply({"params": params}, tokens, cos, sin, mask=mask, cache=cache, method=model.forward_text)
+        # out: (logits, cache, attn?)
+        return out[1]
 
     cache_out = _prefill(params, tokens, cos, sin, mask, cache)
     rope_deltas = jnp.zeros((tokens.shape[0], 1), dtype=jnp.int32)
@@ -136,7 +138,7 @@ def _prefill_vlm(
 
     @jax.jit
     def _prefill(params, tokens, vision_pack, image_pad_id, cos, sin, mask, cache):
-        logits, cache_out = model.apply(
+        out = model.apply(
             {"params": params},
             tokens,
             vision_pack,
@@ -147,7 +149,7 @@ def _prefill_vlm(
             cache=cache,
             method=model.forward_vlm,
         )
-        return logits, cache_out
+        return out[0], out[1]
 
     logits, cache = _prefill(params, tokens, vision_pack, image_pad_id, cos, sin, mask, cache)
     rope_deltas = deltas.astype(jnp.int32)
@@ -168,6 +170,7 @@ def _decode_loop(
     rope_deltas: Optional[jnp.ndarray],
     rng: jax.Array,
     return_logprobs: bool,
+    unroll: int = 1,
 ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
     if steps <= 0:
         empty = jnp.zeros((first_token.shape[0], 0), dtype=jnp.int32)
@@ -181,13 +184,17 @@ def _decode_loop(
     use_top_k = int(top_k) if top_k is not None else 0
     topp_val_py = float(top_p) if (top_p is not None and 0.0 < float(top_p) < 1.0) else None
 
-    @jax.jit
+    # On METAL, buffer donation is not implemented; avoid donating cache arg.
+    _is_metal = (jax.devices()[0].platform.lower() == "metal")
+    _donate = () if _is_metal else (2,)
+
+    @partial(jax.jit, donate_argnums=_donate)
     def _scan_decode(params, offsets, cache_init, first_tok_init, rng_init):
         def _one_step(params, offsets, carry, _):
             cache_state, current_tok, rng_state, stopped = carry
             rng_state, step_key = jax.random.split(rng_state)
             step_mask = (jnp.logical_not(stopped)).astype(jnp.int32)[:, None]
-            logits, cache_state = model.apply(
+            logits, cache_state, _ = model.apply(
                 {"params": params},
                 current_tok,
                 cache_state,
@@ -196,7 +203,23 @@ def _decode_loop(
                 method=model.decode_step,
             )
             logits = logits.astype(jnp.float32) / temp
-            masked = mask_logits_topk_topp(logits, top_k=use_top_k, top_p=topp_val_py)
+            # Guard against NaN/Inf on experimental backends: drop invalids
+            logits = jnp.nan_to_num(
+                logits,
+                nan=jnp.float32(-1e9),
+                neginf=jnp.float32(-1e9),
+                posinf=jnp.float32(-1e9),
+            )
+            # On METAL, prefer top-k shortlist for top-p to avoid argsort issues
+            eff_top_k = use_top_k
+            if _is_metal and (use_top_k == 0) and (topp_val_py is not None):
+                # Prefer a generous shortlist to approximate top-p stably on METAL
+                eff_top_k = 1024
+            masked = mask_logits_topk_topp(logits, top_k=eff_top_k, top_p=topp_val_py)
+            # Fallback if everything got masked (degenerate shortlist)
+            row_max = jnp.max(masked, axis=-1)
+            need_fallback = (row_max <= jnp.float32(-1e8))[:, None]
+            masked = jnp.where(need_fallback, logits, masked)
             next_token = jax.random.categorical(step_key, masked)
             if return_logprobs:
                 log_probs = jax.nn.log_softmax(masked)
@@ -216,12 +239,149 @@ def _decode_loop(
             rng_init,
             jnp.zeros_like(first_tok_init, dtype=jnp.bool_),
         )
-        carry_out, ys = jax.lax.scan(lambda c, _: _one_step(params, offsets, c, _), init_carry, xs=None, length=int(steps))
+        carry_out, ys = jax.lax.scan(
+            lambda c, _: _one_step(params, offsets, c, _),
+            init_carry,
+            xs=None,
+            length=int(steps),
+            unroll=int(max(1, unroll)),
+        )
         tokens_seq, logprobs_seq = ys
         return tokens_seq.transpose(1, 0), logprobs_seq.transpose(1, 0)
 
     offsets = jnp.asarray(rope_deltas if rope_deltas is not None else jnp.zeros((cache.lengths.shape[0], 1), dtype=jnp.int32))
     return _scan_decode(params, offsets, cache, first_token, rng)
+
+
+def _decode_loop_stepwise(
+    model,
+    params,
+    cache: KVCache,
+    first_token: jnp.ndarray,
+    steps: int,
+    *,
+    temperature: float,
+    top_p: Optional[float],
+    eos_id: Optional[int],
+    top_k: Optional[int],
+    rope_deltas: Optional[jnp.ndarray],
+    rng: jax.Array,
+    return_logprobs: bool,
+    step_callback: Optional[object] = None,
+) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
+    """Step-by-step decode where each step is a small jitted call.
+
+    This avoids very long fused kernels that can time out on Metal.
+    """
+    if steps <= 0:
+        empty = jnp.zeros((first_token.shape[0], 0), dtype=jnp.int32)
+        return (empty, empty.astype(jnp.float32)) if return_logprobs else (empty, None)
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+
+    temp = jnp.float32(temperature)
+    eos_scalar = jnp.int32(eos_id if eos_id is not None else -1)
+    has_eos = eos_scalar >= 0
+    use_top_k = int(top_k) if top_k is not None else 0
+    topp_val_py = float(top_p) if (top_p is not None and 0.0 < float(top_p) < 1.0) else None
+
+    offsets = jnp.asarray(rope_deltas if rope_deltas is not None else jnp.zeros((cache.lengths.shape[0], 1), dtype=jnp.int32))
+
+    # On METAL, buffer donation is not implemented; avoid donating cache arg.
+    _is_metal = (jax.devices()[0].platform.lower() == "metal")
+    _donate = () if _is_metal else (2,)
+
+    # Mark `enable_attn` as static so Python control flow depending on it
+    # (e.g., inside model.apply -> attention) is resolved at trace time.
+    @partial(jax.jit, donate_argnums=_donate, static_argnums=(6,))
+    def _one_step(params, offsets, cache_state, current_tok, rng_state, stopped, enable_attn: bool):
+        rng_state, step_key = jax.random.split(rng_state)
+        step_mask = (jnp.logical_not(stopped)).astype(jnp.int32)[:, None]
+        logits, cache_state, attn_row = model.apply(
+            {"params": params},
+            current_tok,
+            cache_state,
+            offsets,
+            step_mask,
+            collect_attn=enable_attn,
+            method=model.decode_step,
+        )
+        logits = logits.astype(jnp.float32) / temp
+        # Guard against NaN/Inf on experimental backends: drop invalids
+        logits = jnp.nan_to_num(
+            logits,
+            nan=jnp.float32(-1e9),
+            neginf=jnp.float32(-1e9),
+            posinf=jnp.float32(-1e9),
+        )
+        # On METAL, prefer top-k shortlist for top-p to avoid argsort issues
+        eff_top_k = use_top_k
+        if _is_metal and (use_top_k == 0) and (topp_val_py is not None):
+            eff_top_k = 1024
+        masked = mask_logits_topk_topp(logits, top_k=eff_top_k, top_p=topp_val_py)
+        # Fallback if everything got masked (degenerate shortlist)
+        row_max = jnp.max(masked, axis=-1)
+        need_fallback = (row_max <= jnp.float32(-1e8))[:, None]
+        masked = jnp.where(need_fallback, logits, masked)
+        next_token = jax.random.categorical(step_key, masked)
+        logprob_row = jax.nn.log_softmax(masked)
+        gathered = logprob_row[jnp.arange(logprob_row.shape[0]), next_token]
+        hit_eos = jnp.logical_and(has_eos, next_token == eos_scalar)
+        stopped_new = jnp.logical_or(stopped, hit_eos)
+        effective_next = jnp.where(jnp.logical_and(stopped, has_eos), jnp.broadcast_to(eos_scalar, next_token.shape), next_token)
+        return cache_state, effective_next.astype(jnp.int32), rng_state, stopped_new, gathered.astype(jnp.float32), attn_row
+
+    tokens_acc: List[jnp.ndarray] = []
+    logprobs_acc: List[jnp.ndarray] = []
+    tok = first_token.astype(jnp.int32)
+    rng_state = rng
+    stopped = jnp.zeros_like(tok, dtype=jnp.bool_)
+    cache_state = cache
+    # Attention summary config
+    enable_attn = bool(step_callback is not None)
+    for i in range(int(steps)):
+        cache_state, tok, rng_state, stopped, logp, attn_row = _one_step(
+            params, offsets, cache_state, tok, rng_state, stopped, enable_attn
+        )
+        tokens_acc.append(tok)
+        if return_logprobs:
+            logprobs_acc.append(logp)
+
+        # Optional per-step callback (Python side) for live UIs
+        if step_callback is not None:
+            try:
+                # Convert small scalars to Python types
+                token_id = int(np.asarray(tok[0]).item())
+                cache_len = int(np.asarray(cache_state.lengths[0]).item())
+                cache_max = int(np.asarray(cache_state.keys.shape[3]).item())
+                token_lp = float(np.asarray(logp[0]).item())
+                rope_delta = int(np.asarray(offsets[0, 0]).item()) if offsets.ndim == 2 else int(np.asarray(offsets[0]).item())
+                info = {
+                    "step": int(i + 1),
+                    "token_id": token_id,
+                    "logprob": token_lp,
+                    "cache_len": cache_len,
+                    "cache_max": cache_max,
+                    "rope_delta": rope_delta,
+                }
+                if enable_attn:
+                    # attn_row: [N, H]
+                    at = np.asarray(attn_row)
+                    if at.size > 0:
+                        info["attn_heads"] = at  # numpy array ok; callback converts/uses
+                try:
+                    step_callback(info)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    new_tokens = jnp.stack(tokens_acc, axis=1)
+    if return_logprobs:
+        new_logprobs = jnp.stack(logprobs_acc, axis=1)
+    else:
+        new_logprobs = None
+    return new_tokens, new_logprobs
 
 
 def sample(
@@ -233,6 +393,9 @@ def sample(
     *,
     tokenizer=None,
     return_logprobs: bool = False,
+    decode_impl: str = "scan",
+    decode_unroll: int = 1,
+    step_callback: Optional[object] = None,
 ) -> SampleResult:
     """Unified sampler entry point.
 
@@ -272,20 +435,38 @@ def sample(
     last_token_idx = jnp.maximum(lengths - 1, 0)
     last_token = jnp.take_along_axis(tokens, last_token_idx[:, None], axis=1).squeeze(1)
 
-    new_tokens, new_logprobs = _decode_loop(
-        model,
-        params,
-        cache,
-        last_token,
-        int(cfg.max_new_tokens),
-        temperature=float(cfg.temperature),
-        top_p=cfg.top_p,
-        eos_id=cfg.eos_id,
-        top_k=cfg.top_k,
-        rope_deltas=rope_deltas,
-        rng=rng,
-        return_logprobs=return_logprobs,
-    )
+    if decode_impl == "step":
+        new_tokens, new_logprobs = _decode_loop_stepwise(
+            model,
+            params,
+            cache,
+            last_token,
+            int(cfg.max_new_tokens),
+            temperature=float(cfg.temperature),
+            top_p=cfg.top_p,
+            eos_id=cfg.eos_id,
+            top_k=cfg.top_k,
+            rope_deltas=rope_deltas,
+            rng=rng,
+            return_logprobs=return_logprobs,
+            step_callback=step_callback,
+        )
+    else:
+        new_tokens, new_logprobs = _decode_loop(
+            model,
+            params,
+            cache,
+            last_token,
+            int(cfg.max_new_tokens),
+            temperature=float(cfg.temperature),
+            top_p=cfg.top_p,
+            eos_id=cfg.eos_id,
+            top_k=cfg.top_k,
+            rope_deltas=rope_deltas,
+            rng=rng,
+            return_logprobs=return_logprobs,
+            unroll=int(max(1, decode_unroll)),
+        )
 
     texts: List[str] = []
     if tokenizer is not None:
