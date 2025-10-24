@@ -103,6 +103,8 @@ config = ml_collections.ConfigDict({
     "ppo_epochs": 1,
     # Memory helpers
     "grad_checkpoint": 0,
+    # Chunk size for vocab-wise logsumexp in PPO (lower = less memory, slower)
+    "vocab_chunk": 8192,
 
     # Optimizer
     "optimizer": "adamw",
@@ -114,6 +116,9 @@ config = ml_collections.ConfigDict({
     # Applies conservative overrides for memory: bf16 params, Adafactor, small PPO minibatch,
     # stricter vision pixel cap, skip DeepStack staging.
     "low_memory": 0,
+    # Enable light auto-tuning: adjusts lr scale when KL is off-target,
+    # and uses more conservative memory defaults.
+    "auto_tune": 1,
 })
 
 # Apply macOS-specific default overrides (CLI flags still win).
@@ -411,6 +416,12 @@ def main(_):
             FLAGS.grad_checkpoint = 1
         except Exception:
             pass
+        # Reduce PPO vocab chunk to trim peak matmul/LSE memory.
+        try:
+            if int(getattr(FLAGS, "vocab_chunk", 8192) or 8192) > 4096:
+                FLAGS.vocab_chunk = 4096
+        except Exception:
+            pass
         # Collection batch can also be trimmed on small-memory devices.
         try:
             if int(getattr(FLAGS, "batch_size", 16) or 16) > 8:
@@ -461,6 +472,7 @@ def main(_):
         kl_coef=float(FLAGS.kl_coef),
         ppo_minibatch=int(FLAGS.ppo_minibatch),
         num_epochs=int(FLAGS.ppo_epochs),
+        vocab_chunk=int(getattr(FLAGS, "vocab_chunk", 8192) or 8192),
     )
 
     kl_ctrl = None
@@ -492,6 +504,13 @@ def main(_):
     save_interval = int(getattr(FLAGS, "save_interval", 0) or 0)
     log_interval = max(1, int(getattr(FLAGS, "log_interval", 1) or 1))
 
+    # Simple adaptive LR scaler to keep KL near target and avoid collapse/explosion.
+    lr_scale = 1.0
+    kl_target = float(getattr(FLAGS, "kl_target", 0.02) or 0.02)
+    kl_lo = 0.5 * kl_target
+    kl_hi = 2.0 * kl_target
+    last_reward = None
+
     for step_idx in range(run_state.iteration, total_steps):
         run_state.iteration = step_idx
         run_state.rng, key = jax.random.split(run_state.rng)
@@ -518,6 +537,8 @@ def main(_):
             num_epochs=trainer_cfg.num_epochs,
             kl_ctrl=kl_ctrl,
             use_checkpoint=bool(int(getattr(FLAGS, "grad_checkpoint", 0) or 0) == 1),
+            vocab_chunk=int(trainer_cfg.vocab_chunk),
+            lr_scale=float(lr_scale),
         )
 
         returns = np.asarray(jax.device_get(rollout.returns))
@@ -554,6 +575,22 @@ def main(_):
             print("[train]", to_print)
             if wandb_run is not None:
                 wandb.log(metrics, step=log_step)
+
+        # Light auto-tuning of lr scaling (optional)
+        if int(getattr(FLAGS, "auto_tune", 1) or 0) == 1:
+            try:
+                approx_kl = float(metrics.get("approx_kl", 0.0))
+                # Adjust lr scale to steer KL toward target
+                if approx_kl < kl_lo:
+                    lr_scale = min(3.0, lr_scale * 1.2)
+                elif approx_kl > kl_hi:
+                    lr_scale = max(0.1, lr_scale * 0.8)
+                # If reward regresses notably, dampen lr a bit
+                if last_reward is not None and (reward_mean < last_reward - 1e-3):
+                    lr_scale = max(0.1, lr_scale * 0.9)
+            except Exception:
+                pass
+        last_reward = reward_mean
 
         if save_interval > 0 and log_step % save_interval == 0 and jax.process_index() == 0:
             _maybe_save(run_state.train_state, FLAGS.save_dir, log_step)

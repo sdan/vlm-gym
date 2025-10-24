@@ -45,6 +45,9 @@ class TrainerConfig:
     kl_coef: float = 0.0
     ppo_minibatch: int = 64
     num_epochs: int = 1
+    # Controls chunking over vocab during log-sum-exp to cap peak memory.
+    # Lower values reduce memory at the cost of some compute.
+    vocab_chunk: int = 8192
 
 
 def _pixels(val: Optional[int]) -> Optional[int]:
@@ -108,6 +111,8 @@ def update(
     num_epochs: int = 1,
     kl_ctrl: Optional[AdaptiveKL] = None,
     use_checkpoint: bool = False,
+    vocab_chunk: int = 8192,
+    lr_scale: float = 1.0,
 ) -> Tuple[TrainState, dict]:
     """Apply PPO-style updates over minibatches and return new TrainState + metrics."""
     tokens_all = batch.tokens
@@ -131,7 +136,9 @@ def update(
                          token_mask: jnp.ndarray,
                          cos: jnp.ndarray,
                          sin: jnp.ndarray,
-                         kl_coef_val: float) -> Tuple[TrainState, dict]:
+                         kl_coef_val: float,
+                         vocab_chunk_local: int,
+                         lr_scale_val: float) -> Tuple[TrainState, dict]:
         text_target = tokens[:, 1:]
 
         def loss_fn(p):
@@ -169,7 +176,7 @@ def update(
 
             # LogSumExp across vocab computed chunkwise to cap peak memory
             V = W.shape[1]
-            CHUNK = 8192  # tuned for Metal stability
+            CHUNK = int(max(1024, vocab_chunk_local))  # configurable for memory control
 
             # Loop over chunks using Python since V and CHUNK are static under jit
             m = jnp.full((N,), jnp.float32(-jnp.inf))
@@ -223,6 +230,9 @@ def update(
             return loss, metrics
 
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(ts.params)
+        # Scale gradients to effectively adjust learning rate on-the-fly
+        if float(lr_scale_val) != 1.0:
+            grads = jax.tree_util.tree_map(lambda g: g * jnp.asarray(lr_scale_val, dtype=jnp.float32), grads)
         updates, opt_state = ts.tx.update(grads, ts.opt_state, ts.params)
         new_params = jax.tree_util.tree_map(lambda p, u: p + u, ts.params, updates)
         new_state = ts.replace(params=new_params, opt_state=opt_state, step=ts.step + 1)
@@ -240,7 +250,9 @@ def update(
                        token_mask: jnp.ndarray,
                        cos: jnp.ndarray,
                        sin: jnp.ndarray,
-                       kl_coef_val: float) -> Tuple[TrainState, dict]:
+                       kl_coef_val: float,
+                       vocab_chunk_local: int,
+                       lr_scale_val: float) -> Tuple[TrainState, dict]:
         text_target = tokens[:, 1:]
 
         def loss_fn(p):
@@ -271,7 +283,7 @@ def update(
             target_logits = tl_flat.reshape(B, Tm1)
 
             V = W.shape[1]
-            CHUNK = 8192
+            CHUNK = int(max(1024, vocab_chunk_local))
             m = jnp.full((N,), jnp.float32(-jnp.inf))
             for start in range(0, int(V), CHUNK):
                 Wc = jax.lax.dynamic_slice_in_dim(W, start, min(CHUNK, int(V) - start), axis=1)
@@ -322,6 +334,9 @@ def update(
         # Average grads and metrics across devices
         grads = jax.lax.pmean(grads, axis_name='data')
         metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name='data'), metrics)
+        # Scale gradients globally to emulate LR adjustment
+        if float(lr_scale_val) != 1.0:
+            grads = jax.tree_util.tree_map(lambda g: g * jnp.asarray(lr_scale_val, dtype=jnp.float32), grads)
         updates, opt_state = ts.tx.update(grads, ts.opt_state, ts.params)
         new_params = jax.tree_util.tree_map(lambda p, u: p + u, ts.params, updates)
         new_state = ts.replace(params=new_params, opt_state=opt_state, step=ts.step + 1)
@@ -404,6 +419,8 @@ def update(
                     cos_mb,
                     sin_mb,
                     coef,
+                    int(vocab_chunk),
+                    float(lr_scale),
                 )
 
                 # Adaptive KL if provided
@@ -477,6 +494,8 @@ def update(
                     cos_all[:, start:end],
                     sin_all[:, start:end],
                     coef,
+                    int(vocab_chunk),
+                    float(lr_scale),
                 )
 
                 # Adaptive KL if provided

@@ -80,6 +80,52 @@ def rms_norm(x: jax.Array, gamma: jax.Array, eps: float) -> jax.Array:
     return (gamma * x_norm).astype(x.dtype)
 
 
+class LoRADense(nn.Module):
+    """Dense layer with optional LoRA adapter.
+
+    Parameters are structured to be compatible with existing checkpoint mappings:
+    - base weights live under `kernel` (and `bias` when enabled), just like nn.Dense
+    - LoRA adapters introduce `lora_A` and `lora_B` params when rank > 0
+    """
+
+    features: int
+    use_bias: bool = True
+    dtype: DType = jnp.bfloat16
+    rank: int = 0
+    alpha: float = 1.0
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        in_features = int(x.shape[-1])
+        kernel = self.param(
+            "kernel",
+            nn.initializers.lecun_normal(),
+            (in_features, self.features),
+            self.dtype,
+        )
+        y = jnp.einsum("...d,df->...f", x.astype(self.dtype), kernel)
+        if self.use_bias:
+            bias = self.param("bias", nn.initializers.zeros, (self.features,), self.dtype)
+            y = y + bias
+
+        if int(self.rank) > 0:
+            # LoRA path: y += scale * (x @ A @ B)
+            A = self.param(
+                "lora_A",
+                nn.initializers.normal(stddev=0.02),
+                (in_features, int(self.rank)),
+                self.dtype,
+            )
+            B = self.param(
+                "lora_B", nn.initializers.zeros, (int(self.rank), self.features), self.dtype
+            )
+            scale = jnp.asarray(self.alpha / float(max(1, int(self.rank))), dtype=jnp.float32)
+            lora = jnp.einsum("...d,dr->...r", x.astype(jnp.float32), A.astype(jnp.float32))
+            lora = jnp.einsum("...r,rf->...f", lora, B.astype(jnp.float32)).astype(self.dtype)
+            y = y + (scale.astype(self.dtype) * lora)
+        return y
+
+
 def rotate_half(x: jax.Array) -> jax.Array:
     # simple rotary quarter-turn
     x1, x2 = jnp.split(x, 2, axis=-1)
@@ -692,7 +738,7 @@ class KVCache(flax.struct.PyTreeNode):
         keys = jnp.zeros((num_layers, batch, num_heads, max_len, head_dim), dtype=dtype)
         values = jnp.zeros((num_layers, batch, num_heads, max_len, head_dim), dtype=dtype)
         lengths = jnp.zeros((batch,), dtype=jnp.int32)
-        return cls(keys=keys, values=values, lengths=lengths)
+    return cls(keys=keys, values=values, lengths=lengths)
 
     def update(
         self,
