@@ -15,6 +15,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from flax import struct
+from vlmrl.models.lora import LoRAConfig, LoRADense
 from safetensors import safe_open
 
 
@@ -438,17 +439,23 @@ class FeedForward(nn.Module):
     intermediate_size: int
     dtype: DType = jnp.bfloat16
     use_bias: bool = False
+    lora: Optional[LoRAConfig] = None
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        gate = nn.Dense(
-            self.intermediate_size, use_bias=self.use_bias, dtype=self.dtype, name="gate_proj"
+        lora_rank = int(self.lora.rank) if (self.lora and self.lora.enabled and self.lora.apply_mlp) else 0
+        lora_alpha = int(self.lora.alpha) if self.lora else 32
+        gate = LoRADense(
+            self.intermediate_size, use_bias=self.use_bias, dtype=self.dtype, name="gate_proj",
+            lora_rank=lora_rank, lora_alpha=lora_alpha,
         )(x)
-        up = nn.Dense(
-            self.intermediate_size, use_bias=self.use_bias, dtype=self.dtype, name="up_proj"
+        up = LoRADense(
+            self.intermediate_size, use_bias=self.use_bias, dtype=self.dtype, name="up_proj",
+            lora_rank=lora_rank, lora_alpha=lora_alpha,
         )(x)
-        down = nn.Dense(
-            self.hidden_size, use_bias=self.use_bias, dtype=self.dtype, name="down_proj"
+        down = LoRADense(
+            self.hidden_size, use_bias=self.use_bias, dtype=self.dtype, name="down_proj",
+            lora_rank=lora_rank, lora_alpha=lora_alpha,
         )(nn.silu(gate) * up)
         return down
 
@@ -461,6 +468,7 @@ class MultiHeadAttention(nn.Module):
     rope_section: Optional[Sequence[int]] = None
     eps: float = 1e-6
     dtype: DType = jnp.bfloat16
+    lora: Optional[LoRAConfig] = None
 
     @nn.compact
     def __call__(
@@ -473,14 +481,19 @@ class MultiHeadAttention(nn.Module):
         layer_id: Optional[int] = None,
         update_lengths: bool = False,
     ) -> tuple[jax.Array, Optional["KVCache"]]:
-        q = nn.Dense(
-            self.num_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="q_proj"
+        lora_rank = int(self.lora.rank) if (self.lora and self.lora.enabled and self.lora.apply_attn) else 0
+        lora_alpha = int(self.lora.alpha) if self.lora else 32
+        q = LoRADense(
+            self.num_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="q_proj",
+            lora_rank=lora_rank, lora_alpha=lora_alpha,
         )(x)
-        k = nn.Dense(
-            self.num_kv_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="k_proj"
+        k = LoRADense(
+            self.num_kv_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="k_proj",
+            lora_rank=lora_rank, lora_alpha=lora_alpha,
         )(x)
-        v = nn.Dense(
-            self.num_kv_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="v_proj"
+        v = LoRADense(
+            self.num_kv_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="v_proj",
+            lora_rank=lora_rank, lora_alpha=lora_alpha,
         )(x)
 
         batch, seqlen, _ = q.shape
@@ -572,9 +585,8 @@ class MultiHeadAttention(nn.Module):
                 v.astype(jnp.float32),
             ).astype(self.dtype)
         attn_output = jnp.transpose(attn_output, (0, 2, 1, 3)).reshape(batch, seqlen, -1)
-        out = nn.Dense(self.hidden_size, use_bias=False, dtype=self.dtype, name="o_proj")(
-            attn_output
-        )
+        out = LoRADense(self.hidden_size, use_bias=False, dtype=self.dtype, name="o_proj",
+                        lora_rank=lora_rank, lora_alpha=lora_alpha)(attn_output)
         return out, cache
 
 
@@ -587,6 +599,7 @@ class DecoderBlock(nn.Module):
     rope_section: Sequence[int]
     eps: float
     dtype: DType = jnp.bfloat16
+    lora: Optional[LoRAConfig] = None
 
     def setup(self) -> None:
         self.input_norm = RMSNorm(self.hidden_size, self.eps, self.dtype)
@@ -599,11 +612,13 @@ class DecoderBlock(nn.Module):
             rope_section=self.rope_section,
             eps=self.eps,
             dtype=self.dtype,
+            lora=self.lora,
         )
         self.mlp = FeedForward(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
             dtype=self.dtype,
+            lora=self.lora,
         )
 
     def __call__(
@@ -690,6 +705,7 @@ class KVCache(flax.struct.PyTreeNode):
 class Qwen3VLModel(nn.Module):
     spec: Qwen3VLSpec
     dtype: DType = jnp.bfloat16
+    lora: Optional[LoRAConfig] = None
 
     def setup(self) -> None:
         text = self.spec.text
@@ -706,6 +722,7 @@ class Qwen3VLModel(nn.Module):
                 rope_section=tuple(text.rope_section),
                 eps=text.rms_norm_eps,
                 dtype=self.dtype,
+                lora=self.lora,
             )
             for _ in range(text.num_hidden_layers)
         ]
@@ -714,7 +731,9 @@ class Qwen3VLModel(nn.Module):
         if self.spec.vision is not None:
             from .vision import Qwen3VisionTransformer
 
-            self.visual = Qwen3VisionTransformer(self.spec.vision)  # optional vision tower
+            # optional vision tower (pass lora if enabled for vision)
+            vision_lora = self.lora if (self.lora and self.lora.enabled and self.lora.apply_vision) else None
+            self.visual = Qwen3VisionTransformer(self.spec.vision, lora=vision_lora)  # type: ignore
         else:
             self.visual = None
 
@@ -1094,10 +1113,10 @@ def _torch_key_to_flax(key: str) -> Optional[str]:
     return None
 
 
-def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
+def create_model_from_hf(hf_dir: str, lora: Optional[LoRAConfig] = None) -> tuple[Qwen3VLModel, dict[str, Any]]:
     cfg = _load_hf_config(hf_dir)
     spec = spec_from_config(cfg)
-    model = Qwen3VLModel(spec)
+    model = Qwen3VLModel(spec, lora=lora)
 
     dummy_ids = jnp.zeros((1, 1), dtype=jnp.int32)
     rope_axes = len(tuple(int(x) for x in spec.text.rope_section))
@@ -1176,15 +1195,51 @@ def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
     return model, flax.core.freeze(param_dict)
 
 
-def create_model_from_ckpt(ckpt_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
+def create_model_from_ckpt(ckpt_dir: str, lora: Optional[LoRAConfig] = None) -> tuple[Qwen3VLModel, dict[str, Any]]:
     from vlmrl.utils.checkpoint import Checkpoint
 
     cfg = _load_hf_config(ckpt_dir)
     spec = spec_from_config(cfg)
-    model = Qwen3VLModel(spec)
+    model = Qwen3VLModel(spec, lora=lora)
+    # Initialize a full param tree (including any LoRA params), then overwrite with checkpoint weights.
+    dummy_ids = jnp.zeros((1, 1), dtype=jnp.int32)
+    rope_axes = len(tuple(int(x) for x in spec.text.rope_section))
+    rope_dim = sum(int(x) for x in spec.text.rope_section) * 2
+    dummy_cos = jnp.zeros((rope_axes, 1, 1, rope_dim), dtype=model.dtype)
+    dummy_sin = jnp.zeros((rope_axes, 1, 1, rope_dim), dtype=model.dtype)
+    text_vars = model.init(jax.random.PRNGKey(0), dummy_ids, dummy_cos, dummy_sin)
+    param_skeleton = flax.core.unfreeze(text_vars["params"])  # includes LoRA params if configured
+
+    if spec.vision is not None:
+        patch_volume = (
+            spec.vision.in_channels
+            * spec.vision.temporal_patch_size
+            * spec.vision.patch_size
+            * spec.vision.patch_size
+        )
+        merge = spec.vision.spatial_merge_size
+        num_tokens = merge * merge
+        dummy_pixels = jnp.zeros((num_tokens, patch_volume), dtype=model.dtype)
+        dummy_grid = jnp.array([[1, merge, merge]], dtype=jnp.int32)
+        vision_vars = model.init(
+            jax.random.PRNGKey(1),
+            dummy_pixels,
+            dummy_grid,
+            method=model.encode_vision,
+        )
+        param_skeleton.update(flax.core.unfreeze(vision_vars["params"]))
+
+    from flax.traverse_util import flatten_dict, unflatten_dict
     ckpt = Checkpoint(f"{ckpt_dir}/params.pkl", parallel=False)
-    params = ckpt.load_as_dict()["params"]
-    return model, params
+    ckpt_params = ckpt.load_as_dict()["params"]
+    flat_skel = flatten_dict(param_skeleton, sep="/")
+    flat_ckpt = flatten_dict(flax.core.unfreeze(ckpt_params), sep="/")
+    # Overwrite any matching keys from checkpoint into the skeleton
+    for k, v in flat_ckpt.items():
+        if k in flat_skel:
+            flat_skel[k] = v
+    merged = unflatten_dict({tuple(k.split("/")): v for k, v in flat_skel.items()})
+    return model, flax.core.freeze(merged)
 
 
 __all__ = [
