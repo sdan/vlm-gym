@@ -1,6 +1,7 @@
 #### Status: Experimental
 
-<img width="325" height="240" alt="vlmgym" src="https://github.com/user-attachments/assets/87d7d141-4464-4687-91c0-3a6da82b2749" />
+
+https://github.com/user-attachments/assets/20baae02-fbca-4ca4-aea7-52d3e12d013b
 
 # vlm-gym
 
