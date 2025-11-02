@@ -35,6 +35,7 @@ from vlmrl.core.kl import AdaptiveKL
 from vlmrl.core.ppo import TrainerConfig, collect, update
 from vlmrl.envs.base import create_env
 from vlmrl.models.qwen3vl.model import Qwen3VLModel, create_model_from_ckpt
+from vlmrl.models.lora import LoRAConfig
 from vlmrl.utils.checkpoint import Checkpoint
 from vlmrl.utils.configs import define_flag_dict
 from vlmrl.utils.train_state import TrainState
@@ -97,6 +98,16 @@ config = ml_collections.ConfigDict({
     "weight_decay": 1e-2,
     "max_grad_norm": 1.0,
     "use_ema": 0,
+
+    # LoRA
+    "lora_enable": 0,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    # one of: none, all, mlp, attn, mlp_attn, vision
+    # default to text-only LoRA (MLP + attention)
+    "lora_modules": "mlp_attn",
+    # recommended ~10x FullFT for longer runs (15x for very short runs)
+    "lora_lr_mult": 10.0,
 })
 define_flag_dict(config)
 FLAGS = flags.FLAGS
@@ -208,30 +219,71 @@ def _format_ground_truth(env_infos: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def _make_optimizer() -> optax.GradientTransformation:
+def _make_optimizer(params=None) -> optax.GradientTransformation:
     lr = float(FLAGS.learning_rate)
     weight_decay = float(FLAGS.weight_decay)
     grad_clip = float(FLAGS.max_grad_norm)
     name = str(FLAGS.optimizer).lower()
 
-    if name == "adafactor":
-        base_opt = optax.adafactor(
-            learning_rate=lr,
-            min_dim_size_to_factor=32,
-            weight_decay_rate=(weight_decay if weight_decay > 0 else None),
-            dtype_momentum=jnp.bfloat16,
-        )
-    else:
-        base_opt = optax.adamw(
-            learning_rate=lr,
-            weight_decay=weight_decay if weight_decay > 0 else 0.0,
-        )
+    def _adamw(lr_scale: float = 1.0) -> optax.GradientTransformation:
+        if name == "adafactor":
+            return optax.adafactor(
+                learning_rate=lr * lr_scale,
+                min_dim_size_to_factor=32,
+                weight_decay_rate=(weight_decay if weight_decay > 0 else None),
+                dtype_momentum=jnp.bfloat16,
+            )
+        else:
+            return optax.adamw(
+                learning_rate=lr * lr_scale,
+                weight_decay=weight_decay if weight_decay > 0 else 0.0,
+            )
 
-    chain = []
-    if grad_clip and grad_clip > 0:
-        chain.append(optax.clip_by_global_norm(grad_clip))
-    chain.append(base_opt)
-    return optax.chain(*chain)
+    # No-decay variant for LoRA adapters only (recommended: 0.0 weight decay)
+    def _adamw_no_decay(lr_scale: float = 1.0) -> optax.GradientTransformation:
+        if name == "adafactor":
+            return optax.adafactor(
+                learning_rate=lr * lr_scale,
+                min_dim_size_to_factor=32,
+                weight_decay_rate=None,
+                dtype_momentum=jnp.bfloat16,
+            )
+        else:
+            return optax.adamw(
+                learning_rate=lr * lr_scale,
+                weight_decay=0.0,
+            )
+
+    lora_enabled = bool(int(getattr(FLAGS, "lora_enable", 0) or 0) == 1)
+    if not lora_enabled or params is None:
+        chain = []
+        if grad_clip and grad_clip > 0:
+            chain.append(optax.clip_by_global_norm(grad_clip))
+        chain.append(_adamw(1.0))
+        return optax.chain(*chain)
+
+    # Build multi_transform: apply optimizer only to LoRA params; zero updates elsewhere.
+    def _label_tree(pytree):
+        from flax.traverse_util import flatten_dict, unflatten_dict
+        flat = flatten_dict(pytree, sep="/")
+        labels = {}
+        for k in flat.keys():
+            leaf_name = k.split("/")[-1]
+            if leaf_name in ("lora_A", "lora_B") or "/lora_" in k:
+                labels[k] = "lora"
+            else:
+                labels[k] = "frozen"
+        return unflatten_dict({tuple(k.split("/")): v for k, v in labels.items()})
+
+    transforms = {
+        "lora": optax.chain(
+            optax.clip_by_global_norm(grad_clip) if (grad_clip and grad_clip > 0) else optax.identity(),
+            _adamw_no_decay(float(getattr(FLAGS, "lora_lr_mult", 10.0) or 10.0)),
+        ),
+        "frozen": optax.set_to_zero(),
+    }
+    labels = _label_tree(params)
+    return optax.multi_transform(transforms, labels)
 
 
 def _build_env(tokenizer):
@@ -272,7 +324,7 @@ def _build_env(tokenizer):
 
 
 def _setup_train_state(model: Qwen3VLModel, params, rng: jax.Array) -> TrainState:
-    tx = _make_optimizer()
+    tx = _make_optimizer(params)
     use_ema = bool(int(getattr(FLAGS, "use_ema", 0) or 0) == 1)
     train_state = TrainState.create_with_params(
         rng=rng,
@@ -320,11 +372,57 @@ def _maybe_save(train_state: TrainState, save_dir: str, step: int) -> None:
 
 
 def main(_):
-    FLAGS(sys.argv)
-
     if jax.process_index() == 0:
         print(f"[train] Loading model from {FLAGS.model_dir}")
-    model, params = create_model_from_ckpt(FLAGS.model_dir)
+
+    # Build LoRA configuration from flags
+    lora_cfg = None
+    if int(getattr(FLAGS, "lora_enable", 0) or 0) == 1:
+        modules = str(getattr(FLAGS, "lora_modules", "all") or "all").lower()
+        apply_attn = modules in ("all", "attn", "mlp_attn")
+        apply_mlp = modules in ("all", "mlp", "mlp_attn")
+        apply_vision = modules in ("all", "vision")
+        lora_cfg = LoRAConfig(
+            enabled=True,
+            rank=int(getattr(FLAGS, "lora_rank", 16) or 16),
+            alpha=int(getattr(FLAGS, "lora_alpha", 32) or 32),
+            apply_attn=apply_attn,
+            apply_mlp=apply_mlp,
+            apply_vision=apply_vision,
+        )
+
+    model, params = create_model_from_ckpt(FLAGS.model_dir, lora=lora_cfg)
+
+    # One-time LoRA summary for sanity checks
+    if jax.process_index() == 0:
+        if lora_cfg and lora_cfg.enabled:
+            try:
+                import flax  # local import to avoid unused in non-LoRA runs
+                from flax.traverse_util import flatten_dict
+                flat = flatten_dict(flax.core.unfreeze(params), sep="/")
+                lora_keys = [k for k in flat.keys() if k.endswith("lora_A") or k.endswith("lora_B")]
+                lora_leaves = len(lora_keys)
+                lora_numel = int(sum(int(np.prod(np.asarray(flat[k]).shape)) for k in lora_keys))
+            except Exception:
+                lora_leaves, lora_numel = 0, 0
+            base_lr = float(FLAGS.learning_rate)
+            lr_mult = float(getattr(FLAGS, "lora_lr_mult", 10.0) or 10.0)
+            eff_lr = base_lr * lr_mult
+            modules = []
+            if getattr(lora_cfg, "apply_mlp", False):
+                modules.append("mlp")
+            if getattr(lora_cfg, "apply_attn", False):
+                modules.append("attn")
+            if getattr(lora_cfg, "apply_vision", False):
+                modules.append("vision")
+            modules_str = ",".join(modules) if modules else "none"
+            print(
+                f"[train] LoRA enabled: modules={modules_str} rank={int(lora_cfg.rank)} "
+                f"alpha={int(lora_cfg.alpha)} lr={base_lr:g} lora_lr={eff_lr:g} "
+                f"lora_leaves={lora_leaves} lora_numel={lora_numel}"
+            )
+        else:
+            print("[train] LoRA disabled")
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.model_dir, trust_remote_code=False)
     pad_id, eos_id = _resolve_pad_and_eos(tokenizer, model)
     image_pad_id = _resolve_image_pad_id(tokenizer, FLAGS.model_dir)

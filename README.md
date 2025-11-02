@@ -7,6 +7,8 @@ https://github.com/user-attachments/assets/20baae02-fbca-4ca4-aea7-52d3e12d013b
 
 A simple reinforcement learning gym for vision-language models, written in JAX. Drop in any environment, any model, and train with PPO.
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/sdan/vlm-gym/blob/master/train_lora.ipynb)
+
 **Core components:**
 - `envs/` — Pluggable vision environments (GeoGuessr, NLVR2, captioning)
 - `models/` — VLM implementations (Qwen3-VL-4B-Instruct reference)
