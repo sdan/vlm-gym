@@ -22,6 +22,16 @@ from typing import Any, Dict, Optional
 # This was annoying and should probably not be off by default
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
+# Ensure macOS Metal-friendly env vars are set before importing jax.
+try:
+    from vlmrl.utils.platform import apply_macos_env, apply_macos_train_overrides, is_macos
+
+    apply_macos_env()
+except Exception:
+    # If platform helper fails for any reason, continue with defaults.
+    def is_macos() -> bool:  # type: ignore
+        return False
+
 import jax
 import jax.numpy as jnp
 import ml_collections
@@ -39,6 +49,7 @@ from vlmrl.utils.checkpoint import Checkpoint
 from vlmrl.utils.configs import define_flag_dict
 from vlmrl.utils.train_state import TrainState
 from vlmrl.utils.wandb import setup_wandb, define_env_metrics, summarize_env_metrics
+from vlmrl.core.trace import compute_update_heat
 
 
 config = ml_collections.ConfigDict({
@@ -90,6 +101,10 @@ config = ml_collections.ConfigDict({
     "kl_coef_max": 0.5,
     "ppo_minibatch": 64,
     "ppo_epochs": 1,
+    # Memory helpers
+    "grad_checkpoint": 0,
+    # Chunk size for vocab-wise logsumexp in PPO (lower = less memory, slower)
+    "vocab_chunk": 8192,
 
     # Optimizer
     "optimizer": "adamw",
@@ -97,7 +112,21 @@ config = ml_collections.ConfigDict({
     "weight_decay": 1e-2,
     "max_grad_norm": 1.0,
     "use_ema": 0,
+    # Low-memory mode: tunes defaults for constrained accelerators (e.g., Colab TPU).
+    # Applies conservative overrides for memory: bf16 params, Adafactor, small PPO minibatch,
+    # stricter vision pixel cap, skip DeepStack staging.
+    "low_memory": 0,
+    # Enable light auto-tuning: adjusts lr scale when KL is off-target,
+    # and uses more conservative memory defaults.
+    "auto_tune": 1,
 })
+
+# Apply macOS-specific default overrides (CLI flags still win).
+try:
+    apply_macos_train_overrides(config)
+except Exception:
+    pass
+
 define_flag_dict(config)
 FLAGS = flags.FLAGS
 
@@ -234,6 +263,32 @@ def _make_optimizer() -> optax.GradientTransformation:
     return optax.chain(*chain)
 
 
+def _cast_params_bf16_except_lm_head(params):
+    """Cast parameter pytree to bf16 except keep lm_head/kernel in fp32 for logits stability."""
+    try:
+        from flax.core import unfreeze, freeze
+    except Exception:
+        return params
+
+    pf = unfreeze(params)
+
+    def _recurse(obj, path=()):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                obj[k] = _recurse(v, path + (k,))
+            return obj
+        try:
+            # Arrays (JAX/NumPy)
+            if len(path) >= 2 and path[-2] == "lm_head" and path[-1] == "kernel":
+                return jnp.asarray(obj, dtype=jnp.float32)
+            return jnp.asarray(obj, dtype=jnp.bfloat16)
+        except Exception:
+            return obj
+
+    pf = _recurse(pf)
+    return freeze(pf)
+
+
 def _build_env(tokenizer):
     name = str(FLAGS.env_name or "").lower()
     max_samples = int(getattr(FLAGS, "env_max_samples", -1) or -1)
@@ -322,9 +377,75 @@ def _maybe_save(train_state: TrainState, save_dir: str, step: int) -> None:
 def main(_):
     FLAGS(sys.argv)
 
+    # Prefer the most precise matmul on METAL to reduce numerical drift.
+    try:
+        from jax import config as jax_config
+
+        if jax.devices() and jax.devices()[0].platform.lower() == "metal":
+            jax_config.update("jax_default_matmul_precision", "highest")
+    except Exception:
+        pass
+
+    # Apply low-memory overrides early so downstream config picks them up.
+    low_mem = bool(int(getattr(FLAGS, "low_memory", 0) or 0) == 1)
+    if low_mem:
+        # Skip staging DeepStack feature copies in training batches.
+        os.environ["VLMRL_SKIP_DEEPSTACK"] = "1"
+        # Prefer Adafactor for optimizer state efficiency.
+        try:
+            FLAGS.optimizer = "adafactor"
+        except Exception:
+            pass
+        # Cap pixels to reduce sequence length (tokens) and activation size.
+        try:
+            if int(getattr(FLAGS, "vlm_max_pixels", -1) or -1) <= 0 or int(FLAGS.vlm_max_pixels) > 120_000:
+                FLAGS.vlm_max_pixels = 120_000
+        except Exception:
+            pass
+        # Keep PPO microbatch small but ensure it uses all local devices for pmap.
+        try:
+            ndev = max(1, int(jax.local_device_count()))
+            current_mb = int(getattr(FLAGS, "ppo_minibatch", 64) or 64)
+            # Do not downscale if user set a larger value; only bump up to at least ndev.
+            if current_mb < ndev:
+                FLAGS.ppo_minibatch = ndev
+        except Exception:
+            pass
+        # Enable gradient checkpointing to reduce activation memory during backward.
+        try:
+            FLAGS.grad_checkpoint = 1
+        except Exception:
+            pass
+        # Reduce PPO vocab chunk to trim peak matmul/LSE memory.
+        try:
+            if int(getattr(FLAGS, "vocab_chunk", 8192) or 8192) > 4096:
+                FLAGS.vocab_chunk = 4096
+        except Exception:
+            pass
+        # Collection batch can also be trimmed on small-memory devices.
+        try:
+            if int(getattr(FLAGS, "batch_size", 16) or 16) > 8:
+                FLAGS.batch_size = 8
+        except Exception:
+            pass
+        # Avoid entropy compute by default; rely on sampling + KL for exploration.
+        try:
+            FLAGS.entropy_coef = 0.0
+        except Exception:
+            pass
+
     if jax.process_index() == 0:
         print(f"[train] Loading model from {FLAGS.model_dir}")
     model, params = create_model_from_ckpt(FLAGS.model_dir)
+    # Cast params to bf16 in low-memory mode to halve footprint (keep lm_head/kernel fp32).
+    if low_mem:
+        try:
+            params = _cast_params_bf16_except_lm_head(params)
+            if jax.process_index() == 0:
+                print("[train] low_memory=1: cast parameters to bfloat16 (lm_head in fp32)")
+        except Exception as exc:
+            if jax.process_index() == 0:
+                print(f"[train] bf16 cast skipped due to: {exc}")
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.model_dir, trust_remote_code=False)
     pad_id, eos_id = _resolve_pad_and_eos(tokenizer, model)
     image_pad_id = _resolve_image_pad_id(tokenizer, FLAGS.model_dir)
@@ -351,6 +472,7 @@ def main(_):
         kl_coef=float(FLAGS.kl_coef),
         ppo_minibatch=int(FLAGS.ppo_minibatch),
         num_epochs=int(FLAGS.ppo_epochs),
+        vocab_chunk=int(getattr(FLAGS, "vocab_chunk", 8192) or 8192),
     )
 
     kl_ctrl = None
@@ -382,6 +504,13 @@ def main(_):
     save_interval = int(getattr(FLAGS, "save_interval", 0) or 0)
     log_interval = max(1, int(getattr(FLAGS, "log_interval", 1) or 1))
 
+    # Simple adaptive LR scaler to keep KL near target and avoid collapse/explosion.
+    lr_scale = 1.0
+    kl_target = float(getattr(FLAGS, "kl_target", 0.02) or 0.02)
+    kl_lo = 0.5 * kl_target
+    kl_hi = 2.0 * kl_target
+    last_reward = None
+
     for step_idx in range(run_state.iteration, total_steps):
         run_state.iteration = step_idx
         run_state.rng, key = jax.random.split(run_state.rng)
@@ -407,6 +536,9 @@ def main(_):
             minibatch_size=trainer_cfg.ppo_minibatch,
             num_epochs=trainer_cfg.num_epochs,
             kl_ctrl=kl_ctrl,
+            use_checkpoint=bool(int(getattr(FLAGS, "grad_checkpoint", 0) or 0) == 1),
+            vocab_chunk=int(trainer_cfg.vocab_chunk),
+            lr_scale=float(lr_scale),
         )
 
         returns = np.asarray(jax.device_get(rollout.returns))
@@ -443,6 +575,22 @@ def main(_):
             print("[train]", to_print)
             if wandb_run is not None:
                 wandb.log(metrics, step=log_step)
+
+        # Light auto-tuning of lr scaling (optional)
+        if int(getattr(FLAGS, "auto_tune", 1) or 0) == 1:
+            try:
+                approx_kl = float(metrics.get("approx_kl", 0.0))
+                # Adjust lr scale to steer KL toward target
+                if approx_kl < kl_lo:
+                    lr_scale = min(3.0, lr_scale * 1.2)
+                elif approx_kl > kl_hi:
+                    lr_scale = max(0.1, lr_scale * 0.8)
+                # If reward regresses notably, dampen lr a bit
+                if last_reward is not None and (reward_mean < last_reward - 1e-3):
+                    lr_scale = max(0.1, lr_scale * 0.9)
+            except Exception:
+                pass
+        last_reward = reward_mean
 
         if save_interval > 0 and log_step % save_interval == 0 and jax.process_index() == 0:
             _maybe_save(run_state.train_state, FLAGS.save_dir, log_step)

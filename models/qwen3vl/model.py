@@ -80,6 +80,52 @@ def rms_norm(x: jax.Array, gamma: jax.Array, eps: float) -> jax.Array:
     return (gamma * x_norm).astype(x.dtype)
 
 
+class LoRADense(nn.Module):
+    """Dense layer with optional LoRA adapter.
+
+    Parameters are structured to be compatible with existing checkpoint mappings:
+    - base weights live under `kernel` (and `bias` when enabled), just like nn.Dense
+    - LoRA adapters introduce `lora_A` and `lora_B` params when rank > 0
+    """
+
+    features: int
+    use_bias: bool = True
+    dtype: DType = jnp.bfloat16
+    rank: int = 0
+    alpha: float = 1.0
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        in_features = int(x.shape[-1])
+        kernel = self.param(
+            "kernel",
+            nn.initializers.lecun_normal(),
+            (in_features, self.features),
+            self.dtype,
+        )
+        y = jnp.einsum("...d,df->...f", x.astype(self.dtype), kernel)
+        if self.use_bias:
+            bias = self.param("bias", nn.initializers.zeros, (self.features,), self.dtype)
+            y = y + bias
+
+        if int(self.rank) > 0:
+            # LoRA path: y += scale * (x @ A @ B)
+            A = self.param(
+                "lora_A",
+                nn.initializers.normal(stddev=0.02),
+                (in_features, int(self.rank)),
+                self.dtype,
+            )
+            B = self.param(
+                "lora_B", nn.initializers.zeros, (int(self.rank), self.features), self.dtype
+            )
+            scale = jnp.asarray(self.alpha / float(max(1, int(self.rank))), dtype=jnp.float32)
+            lora = jnp.einsum("...d,dr->...r", x.astype(jnp.float32), A.astype(jnp.float32))
+            lora = jnp.einsum("...r,rf->...f", lora, B.astype(jnp.float32)).astype(self.dtype)
+            y = y + (scale.astype(self.dtype) * lora)
+        return y
+
+
 def rotate_half(x: jax.Array) -> jax.Array:
     # simple rotary quarter-turn
     x1, x2 = jnp.split(x, 2, axis=-1)
@@ -472,7 +518,8 @@ class MultiHeadAttention(nn.Module):
         cache: Optional["KVCache"] = None,
         layer_id: Optional[int] = None,
         update_lengths: bool = False,
-    ) -> tuple[jax.Array, Optional["KVCache"]]:
+        return_head_max: bool = False,
+    ) -> tuple[jax.Array, Optional["KVCache"], Optional[jax.Array]]:
         q = nn.Dense(
             self.num_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="q_proj"
         )(x)
@@ -530,20 +577,40 @@ class MultiHeadAttention(nn.Module):
             q_grouped = q.reshape(batch, self.num_kv_heads, repeats, q.shape[2], self.head_dim)
             # k stays as (batch, kv_heads, k_len, dim) - no need to expand yet
             
-            # Compute attention scores with einsum that handles the broadcasting
-            attn_scores = jnp.einsum(
-                "bhgqd,bhkd->bhgqk",
-                q_grouped.astype(jnp.float32),
-                k.astype(jnp.float32),
+            # Compute attention scores using batched matmul on flattened (B*Hkv*G) to
+            # avoid multi-dimension contractions that METAL struggles to legalize.
+            qg = q_grouped.astype(jnp.float32)  # [B, Hkv, G, Q, D]
+            kf = k.astype(jnp.float32)          # [B, Hkv, K, D]
+            B, Hkv, G, Q, D = qg.shape
+            K = kf.shape[2]
+            q2 = qg.reshape(B * Hkv * G, Q, D)
+            k2 = kf.reshape(B * Hkv, K, D)
+            # Repeat keys across the grouped-repeat dimension
+            k2 = jnp.repeat(k2, repeats=G, axis=0)  # [B*Hkv*G, K, D]
+            # scores: [B*Hkv*G, Q, K]
+            attn_scores = jax.lax.dot_general(
+                q2,
+                jnp.swapaxes(k2, -1, -2),
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                precision=jax.lax.Precision.HIGHEST,
             ) * (self.head_dim ** -0.5)
-            # Reshape back to (batch, num_heads, q_len, k_len)
-            attn_scores = attn_scores.reshape(batch, self.num_heads, q.shape[2], k.shape[2])
+            # Reshape back to (B, H, Q, K)
+            attn_scores = attn_scores.reshape(B, Hkv, G, Q, K).reshape(batch, self.num_heads, q.shape[2], k.shape[2])
         else:
-            attn_scores = jnp.einsum(
-                "bhqd,bhkd->bhqk",
-                q.astype(jnp.float32),
-                k.astype(jnp.float32),
+            # Non-grouped case: use batched matmul over (B*H)
+            qf = q.astype(jnp.float32)  # [B, H, Q, D]
+            kf = k.astype(jnp.float32)  # [B, H, K, D]
+            B, H, Q, D = qf.shape
+            K = kf.shape[2]
+            q2 = qf.reshape(B * H, Q, D)
+            k2 = kf.reshape(B * H, K, D)
+            attn_scores = jax.lax.dot_general(
+                q2,
+                jnp.swapaxes(k2, -1, -2),
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                precision=jax.lax.Precision.HIGHEST,
             ) * (self.head_dim ** -0.5)
+            attn_scores = attn_scores.reshape(B, H, Q, K)
         attn_scores = attn_scores + (1.0 - history_mask)[:, None, None, :].astype(jnp.float32) * -1e9  # mask pad
         q_len = attn_scores.shape[2]
         if q_len > 1:
@@ -551,31 +618,51 @@ class MultiHeadAttention(nn.Module):
             causal = jnp.tril(jnp.ones((q_len, k_len), dtype=jnp.float32))  # causal triangle
             attn_scores = attn_scores + (1.0 - causal)[None, None, :, :] * -1e9
         attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+        head_max: Optional[jax.Array] = None
+        if return_head_max:
+            # Per-head max attention on the last query position
+            head_max = jnp.max(attn_weights[:, :, -1, :], axis=-1)  # [B, H]
         
         # Apply attention weights with grouped-query pattern if needed
         if self.num_heads != self.num_kv_heads:
             repeats = self.num_heads // self.num_kv_heads
             # Reshape weights for grouped computation
-            attn_weights_grouped = attn_weights.reshape(batch, self.num_kv_heads, repeats, q_len, -1)
-            # Compute output with einsum that handles the broadcasting
-            attn_output = jnp.einsum(
-                "bhgqk,bhkd->bhgqd",
-                attn_weights_grouped,
-                v.astype(jnp.float32),
+            AWg = attn_weights.reshape(batch, self.num_kv_heads, repeats, q_len, -1)  # [B,Hkv,G,Q,K]
+            vf = v.astype(jnp.float32)  # [B, Hkv, K, D]
+            B, Hkv, G, Q, K = AWg.shape
+            D = vf.shape[-1]
+            AW2 = AWg.reshape(B * Hkv * G, Q, K)
+            v2 = vf.reshape(B * Hkv, K, D)
+            v2 = jnp.repeat(v2, repeats=G, axis=0)  # [B*Hkv*G, K, D]
+            # out2: [B*Hkv*G, Q, D]
+            out2 = jax.lax.dot_general(
+                AW2,
+                v2,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                precision=jax.lax.Precision.HIGHEST,
             )
-            # Reshape back to (batch, num_heads, q_len, head_dim)
-            attn_output = attn_output.reshape(batch, self.num_heads, q_len, self.head_dim).astype(self.dtype)
+            # Reshape back to (B, H, Q, D)
+            attn_output = out2.reshape(B, Hkv, G, Q, D).reshape(batch, self.num_heads, q_len, self.head_dim).astype(self.dtype)
         else:
-            attn_output = jnp.einsum(
-                "bhqk,bhkd->bhqd",
-                attn_weights,
-                v.astype(jnp.float32),
-            ).astype(self.dtype)
+            # Non-grouped case: (B*H) batched matmul
+            AW = attn_weights  # [B, H, Q, K]
+            vf = v.astype(jnp.float32)  # [B, H, K, D]
+            B, H, Q, K = AW.shape
+            D = vf.shape[-1]
+            AW2 = AW.reshape(B * H, Q, K)
+            v2 = vf.reshape(B * H, K, D)
+            out2 = jax.lax.dot_general(
+                AW2,
+                v2,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                precision=jax.lax.Precision.HIGHEST,
+            )
+            attn_output = out2.reshape(B, H, Q, D).astype(self.dtype)
         attn_output = jnp.transpose(attn_output, (0, 2, 1, 3)).reshape(batch, seqlen, -1)
         out = nn.Dense(self.hidden_size, use_bias=False, dtype=self.dtype, name="o_proj")(
             attn_output
         )
-        return out, cache
+        return out, cache, head_max
 
 
 class DecoderBlock(nn.Module):
@@ -615,8 +702,9 @@ class DecoderBlock(nn.Module):
         cache: Optional["KVCache"],
         layer_id: int,
         update_lengths: bool = False,
-    ) -> tuple[jax.Array, Optional["KVCache"]]:
-        attn_out, cache = self.attn(
+        collect_attn: bool = False,
+    ) -> tuple[jax.Array, Optional["KVCache"], Optional[jax.Array]]:
+        attn_out, cache, head_max = self.attn(
             self.input_norm(hidden_states),
             cos,
             sin,
@@ -624,10 +712,11 @@ class DecoderBlock(nn.Module):
             cache,
             layer_id,
             update_lengths=update_lengths,
+            return_head_max=collect_attn,
         )
         hidden_states = hidden_states + attn_out  # res
         hidden_states = hidden_states + self.mlp(self.post_norm(hidden_states))  # res
-        return hidden_states, cache
+        return hidden_states, cache, head_max
 
 
 class KVCache(flax.struct.PyTreeNode):
@@ -649,7 +738,7 @@ class KVCache(flax.struct.PyTreeNode):
         keys = jnp.zeros((num_layers, batch, num_heads, max_len, head_dim), dtype=dtype)
         values = jnp.zeros((num_layers, batch, num_heads, max_len, head_dim), dtype=dtype)
         lengths = jnp.zeros((batch,), dtype=jnp.int32)
-        return cls(keys=keys, values=values, lengths=lengths)
+    return cls(keys=keys, values=values, lengths=lengths)
 
     def update(
         self,
@@ -749,12 +838,15 @@ class Qwen3VLModel(nn.Module):
         cache: Optional[KVCache] = None,
         visual_mask: Optional[jax.Array] = None,
         deepstack: Optional[tuple[jax.Array, ...]] = None,
-    ) -> tuple[jax.Array, Optional[KVCache]]:
+        *,
+        collect_attn: bool = False,
+    ) -> tuple[jax.Array, Optional[KVCache], Optional[jax.Array]]:
         new_cache = cache
         last_layer_idx = len(self.layers) - 1
         deepstack = deepstack or ()
+        attn_rows: list[jax.Array] = []
         for layer_id, layer in enumerate(self.layers):
-            hidden, new_cache = layer(
+            hidden, new_cache, head_max = layer(
                 hidden,
                 cos,
                 sin,
@@ -762,12 +854,20 @@ class Qwen3VLModel(nn.Module):
                 new_cache,
                 layer_id,
                 update_lengths=bool(cache is not None and layer_id == last_layer_idx),  # bump cache len at last layer
+                collect_attn=collect_attn,
             )
+            if collect_attn and head_max is not None:
+                attn_rows.append(head_max)  # [B, H]
             if deepstack and layer_id < len(deepstack) and visual_mask is not None:
                 hidden = self._apply_deepstack_features(hidden, visual_mask, deepstack[layer_id])
         hidden = self.final_norm(hidden)
         logits = self.lm_head(hidden.astype(jnp.float32))  # keep logits in fp32
-        return logits, new_cache
+        attn_summary: Optional[jax.Array] = None
+        if collect_attn and attn_rows:
+            # Stack per-layer rows -> [L, B, H], take last 6 layers -> [N<=6, B, H]
+            rows = jnp.stack(attn_rows, axis=0)
+            attn_summary = rows[-6:, ...]
+        return logits, new_cache, attn_summary
 
     def forward_text(
         self,
@@ -776,9 +876,18 @@ class Qwen3VLModel(nn.Module):
         sin: jax.Array,
         mask: Optional[jax.Array] = None,
         cache: Optional[KVCache] = None,
-    ) -> tuple[jax.Array, Optional[KVCache]]:
+        *,
+        collect_attn: bool = False,
+    ) -> tuple[jax.Array, Optional[KVCache], Optional[jax.Array]]:
         hidden = self.embed(tokens)
-        return self._decode_from_hidden(hidden, cos, sin, mask, cache)
+        return self._decode_from_hidden(
+            hidden,
+            cos,
+            sin,
+            mask,
+            cache,
+            collect_attn=collect_attn,
+        )
 
     def forward_vlm(
         self,
@@ -789,7 +898,9 @@ class Qwen3VLModel(nn.Module):
         sin: jax.Array,
         mask: Optional[jax.Array] = None,
         cache: Optional[KVCache] = None,
-    ) -> tuple[jax.Array, Optional[KVCache]]:
+        *,
+        collect_attn: bool = False,
+    ) -> tuple[jax.Array, Optional[KVCache], Optional[jax.Array]]:
         hidden = self.embed(tokens)
         batch = hidden.shape[0]
 
@@ -831,7 +942,76 @@ class Qwen3VLModel(nn.Module):
             cache,
             visual_mask=visual_mask,
             deepstack=vision_pack.deepstack,
+            collect_attn=collect_attn,
         )
+
+    def forward_vlm_hidden(
+        self,
+        tokens: jax.Array,
+        vision_embeds: Union[jax.Array, VisionEmbeddings],
+        image_pad_id: int,
+        cos: jax.Array,
+        sin: jax.Array,
+        mask: Optional[jax.Array] = None,
+        cache: Optional[KVCache] = None,
+    ) -> tuple[jax.Array, Optional[KVCache]]:
+        """Same as forward_vlm but returns the final normalized hidden states.
+
+        This is useful for memory-lean losses that avoid materializing the
+        full [B, T, V] logits tensor. The returned hidden is the output of
+        the final RMSNorm and matches the input expected by `lm_head` when
+        cast to fp32.
+        """
+        hidden = self.embed(tokens)
+        batch = hidden.shape[0]
+
+        if isinstance(vision_embeds, VisionEmbeddings):
+            vision_pack = vision_embeds.cast(self.dtype).with_batch_dim(batch)
+        else:
+            vision_arr = jnp.asarray(vision_embeds, dtype=self.dtype)
+            if vision_arr.ndim == 2:
+                vision_arr = vision_arr[None, ...]
+            if vision_arr.shape[0] not in (1, batch):
+                raise ValueError(
+                    "vision_embeds batch dimension must be 1 or match tokens batch"
+                )
+            if vision_arr.shape[0] == 1 and batch > 1:
+                vision_arr = jnp.tile(vision_arr, (batch, 1, 1))
+            vision_pack = VisionEmbeddings(tokens=vision_arr, deepstack=())
+
+        visual_mask = (tokens == jnp.int32(image_pad_id))
+
+        def _inject(batch_hidden, batch_tokens, batch_vis):
+            num_vision = batch_vis.shape[0]
+            pad_positions = jnp.where(
+                batch_tokens == jnp.int32(image_pad_id), size=num_vision, fill_value=-1
+            )[0]
+            valid = pad_positions >= 0
+            pad_positions = jnp.where(valid, pad_positions, 0)
+            updates = jnp.where(valid[:, None], batch_vis.astype(batch_hidden.dtype), batch_hidden[pad_positions])
+            batch_hidden = batch_hidden.at[pad_positions].set(updates)
+            return batch_hidden
+
+        hidden = jax.vmap(_inject)(hidden, tokens, vision_pack.tokens)
+
+        new_cache = cache
+        last_layer_idx = len(self.layers) - 1
+        deepstack = vision_pack.deepstack or ()
+        for layer_id, layer in enumerate(self.layers):
+            hidden, new_cache, _ = layer(
+                hidden,
+                cos,
+                sin,
+                mask,
+                new_cache,
+                layer_id,
+                update_lengths=bool(cache is not None and layer_id == last_layer_idx),
+            )
+            if deepstack and layer_id < len(deepstack) and visual_mask is not None:
+                hidden = self._apply_deepstack_features(hidden, visual_mask, deepstack[layer_id])
+
+        hidden = self.final_norm(hidden)
+        return hidden, new_cache
 
     def encode_vision(self, pixel_values: jax.Array, grid_thw: jax.Array) -> VisionEmbeddings:
         if self.visual is None:
@@ -845,7 +1025,9 @@ class Qwen3VLModel(nn.Module):
         cache: KVCache,
         rope_deltas: Optional[jax.Array],
         mask: Optional[jax.Array] = None,
-    ) -> tuple[jax.Array, KVCache]:
+        *,
+        collect_attn: bool = False,
+    ) -> tuple[jax.Array, KVCache, jax.Array]:
         if token.ndim != 1:
             raise ValueError("token must have shape (batch,)")
         positions = cache.lengths[:, None]  # next token positions
@@ -870,8 +1052,20 @@ class Qwen3VLModel(nn.Module):
         step_tokens = token[:, None]
         if mask is None:
             mask = jnp.ones((step_tokens.shape[0], 1), dtype=jnp.int32)
-        logits, new_cache = self.forward_text(step_tokens, cos, sin, mask=mask, cache=cache)
-        return logits[:, -1, :], new_cache
+        logits, new_cache, attn_summary = self.forward_text(
+            step_tokens,
+            cos,
+            sin,
+            mask=mask,
+            cache=cache,
+            collect_attn=collect_attn,
+        )
+        # Normalize attn_summary to [N, H] (batch squeezed) with stable shape when disabled
+        if attn_summary is None:
+            attn_out = jnp.zeros((6, int(self.spec.text.num_attention_heads)), dtype=jnp.float32)
+        else:
+            attn_out = attn_summary[:, 0, :].astype(jnp.float32)
+        return logits[:, -1, :], new_cache, attn_out
 
     def __call__(
         self,
@@ -881,7 +1075,8 @@ class Qwen3VLModel(nn.Module):
         mask: Optional[jax.Array] = None,
         cache: Optional[KVCache] = None,
     ) -> tuple[jax.Array, Optional[KVCache]]:
-        return self.forward_text(tokens, cos, sin, mask=mask, cache=cache)
+        logits, cache = self.forward_text(tokens, cos, sin, mask=mask, cache=cache)[:2]
+        return logits, cache
 
 
 def _load_hf_config(hf_dir: str) -> dict[str, Any]:
@@ -1094,10 +1289,14 @@ def _torch_key_to_flax(key: str) -> Optional[str]:
     return None
 
 
-def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
+def create_model_from_hf(hf_dir: str, dtype: Optional[str] = None) -> tuple[Qwen3VLModel, dict[str, Any]]:
     cfg = _load_hf_config(hf_dir)
     spec = spec_from_config(cfg)
-    model = Qwen3VLModel(spec)
+    if dtype is not None:
+        dtype_map = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "bf16": jnp.bfloat16, "fp32": jnp.float32}
+        model = Qwen3VLModel(spec, dtype=dtype_map.get(str(dtype).lower(), jnp.bfloat16))
+    else:
+        model = Qwen3VLModel(spec)
 
     dummy_ids = jnp.zeros((1, 1), dtype=jnp.int32)
     rope_axes = len(tuple(int(x) for x in spec.text.rope_section))
@@ -1176,12 +1375,16 @@ def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
     return model, flax.core.freeze(param_dict)
 
 
-def create_model_from_ckpt(ckpt_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
+def create_model_from_ckpt(ckpt_dir: str, dtype: Optional[str] = None) -> tuple[Qwen3VLModel, dict[str, Any]]:
     from vlmrl.utils.checkpoint import Checkpoint
 
     cfg = _load_hf_config(ckpt_dir)
     spec = spec_from_config(cfg)
-    model = Qwen3VLModel(spec)
+    if dtype is not None:
+        dtype_map = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "bf16": jnp.bfloat16, "fp32": jnp.float32}
+        model = Qwen3VLModel(spec, dtype=dtype_map.get(str(dtype).lower(), jnp.bfloat16))
+    else:
+        model = Qwen3VLModel(spec)
     ckpt = Checkpoint(f"{ckpt_dir}/params.pkl", parallel=False)
     params = ckpt.load_as_dict()["params"]
     return model, params

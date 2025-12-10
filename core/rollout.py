@@ -17,6 +17,15 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+# Apply macOS Metal-friendly env vars before importing jax.
+try:
+    from vlmrl.utils.platform import apply_macos_env, is_macos
+
+    apply_macos_env()
+except Exception:
+    def is_macos() -> bool:  # type: ignore
+        return False
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -216,6 +225,9 @@ def _sample_prompt(
     rng: jax.Array,
     return_logprobs: bool,
     max_sequence_length: Optional[int],
+    decode_impl: str = "scan",
+    decode_unroll: int = 1,
+    step_callback: Optional[object] = None,
 ) -> SampledAction:
     """Run the unified sampler on a prepared prompt and normalize outputs."""
     inputs = VLMInputs(
@@ -232,6 +244,9 @@ def _sample_prompt(
         rng=rng,
         tokenizer=tokenizer,
         return_logprobs=return_logprobs,
+        decode_impl=decode_impl,
+        decode_unroll=int(max(1, decode_unroll)),
+        step_callback=step_callback,
     )
 
     gen_tokens = result.tokens[0]
@@ -314,6 +329,9 @@ def collect_episodes(
     max_pixels: Optional[int] = None,
     max_sequence_length: Optional[int] = None,
     return_logprobs: bool = True,
+    decode_impl: str = "scan",
+    decode_unroll: int = 1,
+    step_callback: Optional[object] = None,
 ) -> EpisodeBatch:
     """Collect a batch of environment episodes using the unified sampler."""
     states: List[BaseState] = []
@@ -348,6 +366,9 @@ def collect_episodes(
                 rng=key,
                 return_logprobs=return_logprobs,
                 max_sequence_length=max_sequence_length,
+                decode_impl=decode_impl,
+                decode_unroll=decode_unroll,
+                step_callback=step_callback,
             )
         )
 
@@ -451,20 +472,72 @@ def _resolve_image_pad_id(tokenizer, model_dir: str) -> int:
 def main() -> None:
     """Simple CLI for sampling environment episodes without PPO."""
     parser = argparse.ArgumentParser(description="Collect RL episodes using the unified sampler.")
-    parser.add_argument("--model_dir", required=True, type=str, help="Model directory containing weights, config, and tokenizer.")
-    parser.add_argument("--env_name", required=True, type=str, help="Environment identifier (e.g., vision, geospot).")
+
+    # Platform-aware defaults for macOS local runs
+    mac = is_macos()
+    default_top_k = 256 if mac else None
+    default_max_new_tokens = 32 if mac else 64
+    default_max_pixels = 16_384 if mac else -1
+    default_dtype = "float32" if mac else None
+    default_decode_impl = "step" if mac else "scan"
+    default_max_seq_len = 256 if mac else None
+
+    parser.add_argument("--model_dir", "--model-dir", required=True, type=str, help="Model directory containing weights, config, and tokenizer.")
+    parser.add_argument("--env_name", "--env-name", required=True, type=str, help="Environment identifier (e.g., vision, geospot).")
     parser.add_argument("--episodes", type=int, default=4, help="Total number of episodes to sample.")
     parser.add_argument("--batch_size", type=int, default=1, help="Episodes to sample in parallel.")
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top_p", type=float, default=0.9)
-    parser.add_argument("--top_k", type=int, default=None)
-    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--top_p", "--top-p", type=float, default=0.9)
+    parser.add_argument("--top_k", "--top-k", type=int, default=default_top_k)
+    parser.add_argument("--max_new_tokens", "--max-new-tokens", type=int, default=default_max_new_tokens)
+    parser.add_argument("--max_sequence_length", "--max-sequence-length", type=int, default=default_max_seq_len, help="Optional cap on total prompt+generation token length.")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--min_pixels", type=int, default=-1, help="Override minimum resized pixels (<=0 keeps default).")
-    parser.add_argument("--max_pixels", type=int, default=-1, help="Override maximum resized pixels (<=0 keeps default).")
+    parser.add_argument("--min_pixels", "--min-pixels", type=int, default=-1, help="Override minimum resized pixels (<=0 keeps default).")
+    parser.add_argument("--max_pixels", "--max-pixels", type=int, default=default_max_pixels, help="Override maximum resized pixels (<=0 keeps default).")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=default_dtype,
+        choices=[None, "float32", "bfloat16", "bf16", "fp32"],
+        help="Override model compute dtype (use float32 on Metal for stability)",
+    )
+    parser.add_argument(
+        "--decode_impl", "--decode-impl",
+        type=str,
+        default=default_decode_impl,
+        choices=["scan", "step"],
+        help="Decode implementation: scan (fast) or step (Metal-safe).",
+    )
+    parser.add_argument(
+        "--decode_unroll", "--decode-unroll",
+        type=int,
+        default=1,
+        help="Unroll factor for scan decode (suggest 4 or 8 on GPU)",
+    )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Enable live TUI visualization of attention, KV cache, and sampling",
+    )
+    parser.add_argument(
+        "--tui_mode", "--tui-mode",
+        type=str,
+        choices=["simple", "advanced", "merged"],
+        default="simple",
+        help="TUI layout: simple episode list, advanced metrics, or both (merged)",
+    )
     args = parser.parse_args()
 
-    model, params = create_model_from_ckpt(args.model_dir)
+    # Prefer the most precise matmul on METAL to reduce numerical drift.
+    try:
+        from jax import config as jax_config
+
+        if jax.devices() and jax.devices()[0].platform.lower() == "metal":
+            jax_config.update("jax_default_matmul_precision", "highest")
+    except Exception:
+        pass
+
+    model, params = create_model_from_ckpt(args.model_dir, dtype=args.dtype)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=False)
     env = create_env(args.env_name, tokenizer)
     image_pad_id = _resolve_image_pad_id(tokenizer, args.model_dir)
@@ -478,40 +551,154 @@ def main() -> None:
         max_new_tokens=int(args.max_new_tokens),
     )
 
+    # Initialize TUI if requested
+    tui = None
+    if args.tui:
+        try:
+            from vlmrl.utils.tui_live import LiveTUI, DecodeState, TrainingState, EpisodeView
+            tui = LiveTUI(
+                num_layers=model.spec.text.num_hidden_layers,
+                num_heads=model.spec.text.num_attention_heads,
+                display_layers=6,
+                max_cache=2048,
+                view_mode=args.tui_mode,
+            )
+            tui.start()
+            print("TUI visualization enabled.")
+        except Exception as e:
+            print(f"Warning: Could not initialize TUI: {e}")
+            tui = None
+
     rng = jax.random.PRNGKey(int(args.seed))
     remaining = max(0, int(args.episodes))
     batch_size = max(1, int(args.batch_size))
     taken = 0
     rewards: List[float] = []
 
-    while remaining > 0:
-        take = min(batch_size, remaining)
-        rng, subkey = jax.random.split(rng)
-        batch = collect_episodes(
-            env,
-            tokenizer,
-            model,
-            params,
-            sampling_cfg,
-            image_pad_id=image_pad_id,
-            batch_size=take,
-            rng=subkey,
-            min_pixels=(args.min_pixels if args.min_pixels and args.min_pixels > 0 else None),
-            max_pixels=(args.max_pixels if args.max_pixels and args.max_pixels > 0 else None),
-            max_sequence_length=None,
-            return_logprobs=False,
-        )
-        for episode in batch.episodes:
-            rewards.append(float(episode.reward))
-            response_preview = episode.generated_text.replace("\n", " ").strip()
-            prompt_preview = episode.prompt_text.strip().splitlines()[-1] if episode.prompt_text.strip() else ""
-            info_keys = ", ".join(sorted(episode.info.keys())) if episode.info else "none"
-            print(
-                f"[episode {taken}] reward={episode.reward:.3f} done={episode.done} "
-                f"prompt='{prompt_preview}' response='{response_preview}' info_keys={info_keys}"
+    try:
+        while remaining > 0:
+            take = min(batch_size, remaining)
+            rng, subkey = jax.random.split(rng)
+            # Optional per-token decode callback for TUI in step mode
+            step_cb = None
+            if tui is not None and args.decode_impl == "step":
+                def _step_cb(info):
+                    try:
+                        token_id = int(info.get("token_id", 0))
+                        token_text = tokenizer.decode([token_id])
+                        prob = float(np.exp(info.get("logprob", 0.0)))
+                        cache_len = int(info.get("cache_len", 0))
+                        cache_max = int(info.get("cache_max", 0))
+                        # mRoPE positions for text tokens share axes; derive from cache len + rope delta
+                        rope_delta = int(info.get("rope_delta", 0))
+                        mpos = cache_len + rope_delta
+                        attn_heads = info.get("attn_heads", None)
+                        attn_pattern = None
+                        active_head = 0
+                        if attn_heads is not None:
+                            try:
+                                # attn_heads: [N, H] for last N layers
+                                attn_np = np.asarray(attn_heads, dtype=np.float32)
+                                if attn_np.ndim == 2 and attn_np.shape[1] == model.spec.text.num_attention_heads:
+                                    attn_pattern = attn_np
+                                    # Choose strongest head from the most recent layer
+                                    last_row = attn_np[-1]
+                                    active_head = int(np.argmax(last_row))
+                            except Exception:
+                                attn_pattern = None
+                                active_head = 0
+                        ds = DecodeState(
+                            step=int(info.get("step", 0)),
+                            token_id=token_id,
+                            token_text=token_text,
+                            token_prob=prob,
+                            cache_len=cache_len,
+                            cache_max=cache_max if cache_max > 0 else 2048,
+                            active_layer=max(0, model.spec.text.num_hidden_layers - 1),
+                            active_head=int(active_head),
+                            mrope_t=mpos,
+                            mrope_h=mpos,
+                            mrope_w=mpos,
+                            attention_pattern=attn_pattern,
+                        )
+                        tui.update_decode(ds)
+                    except Exception:
+                        pass
+                step_cb = _step_cb
+
+            batch = collect_episodes(
+                env,
+                tokenizer,
+                model,
+                params,
+                sampling_cfg,
+                image_pad_id=image_pad_id,
+                batch_size=take,
+                rng=subkey,
+                min_pixels=(args.min_pixels if args.min_pixels and args.min_pixels > 0 else None),
+                max_pixels=(args.max_pixels if args.max_pixels and args.max_pixels > 0 else None),
+                max_sequence_length=(args.max_sequence_length if args.max_sequence_length and args.max_sequence_length > 0 else None),
+                return_logprobs=bool(tui is not None),
+                decode_impl=args.decode_impl,
+                decode_unroll=int(max(1, args.decode_unroll)),
+                step_callback=step_cb,
             )
-            taken += 1
-        remaining -= take
+            for episode in batch.episodes:
+                rewards.append(float(episode.reward))
+                response_preview = episode.generated_text.replace("\n", " ").strip()
+                prompt_preview = episode.prompt_text.strip().splitlines()[-1] if episode.prompt_text.strip() else ""
+                info_keys = ", ".join(sorted(episode.info.keys())) if episode.info else "none"
+
+                # Update TUI with episode data
+                if tui is not None:
+                    # Training state update
+                    training_state = TrainingState(
+                        step=taken,
+                        reward_mean=float(np.mean(rewards[-10:])) if rewards else 0.0,
+                        reward_std=float(np.std(rewards[-10:])) if len(rewards) > 1 else 0.0,
+                        kl=0.0,  # Not available in rollout-only mode
+                        loss=0.0,
+                        tokens_per_sec=0.0,  # Could calculate from timing
+                        gpu_util=0.0,
+                    )
+                    tui.update_training(training_state)
+
+                    # Token credit update
+                    tokens_text = [tokenizer.decode([t]) for t in episode.action_tokens[:10]]  # First 10 tokens
+                    # Convert log-probs to probabilities for readable bars
+                    credits_lp = np.asarray(episode.action_logprobs[:10], dtype=np.float32)
+                    if credits_lp.size > 0:
+                        credits = np.clip(np.exp(credits_lp), 0.0, 1.0)
+                        tui.update_credit(tokens_text, credits.tolist())
+
+                    # Simple decode: append full prompt/output for this episode
+                    try:
+                        ev = EpisodeView(
+                            idx=taken,
+                            reward=float(episode.reward),
+                            done=bool(episode.done),
+                            prompt=str(episode.prompt_text or ""),
+                            output=str(episode.generated_text or ""),
+                        )
+                        tui.update_episode(ev)
+                    except Exception:
+                        pass
+
+                # Print to console (unless TUI is active)
+                if tui is None:
+                    print(
+                        f"[episode {taken}] reward={episode.reward:.3f} done={episode.done} "
+                        f"prompt='{prompt_preview}' response='{response_preview}' info_keys={info_keys}"
+                    )
+                taken += 1
+            remaining -= take
+
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user.")
+    finally:
+        # Cleanup TUI
+        if tui is not None:
+            tui.stop()
 
     if rewards:
         mean_reward = float(np.mean(rewards))
